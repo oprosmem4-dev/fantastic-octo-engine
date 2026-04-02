@@ -1,0 +1,75 @@
+version: "3.9"
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: tgsaas
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  # ── Главный бот ─────────────────────────────────────────────────────────────
+  bot:
+    build: .
+    restart: unless-stopped
+    command: python bot/main_bot.py
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - sessions:/app/sessions   # Telethon session-файлы
+
+  # ── Зеркальные боты ─────────────────────────────────────────────────────────
+  mirrors:
+    build: .
+    restart: unless-stopped
+    command: python bot/mirror_runner.py
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - sessions:/app/sessions
+
+  # ── Воркер рассылок ──────────────────────────────────────────────────────────
+  worker:
+    build: .
+    restart: unless-stopped
+    command: python worker/worker.py
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - sessions:/app/sessions
+
+  # ── FastAPI ──────────────────────────────────────────────────────────────────
+  api:
+    build: .
+    restart: unless-stopped
+    command: python api/app.py
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+
+volumes:
+  postgres_data:
+  sessions:

@@ -1,0 +1,21 @@
+# Telegram боты
+aiogram==3.7.0
+telethon==1.36.0
+
+# База данных
+sqlalchemy[asyncio]==2.0.30
+asyncpg==0.29.0
+alembic==1.13.1
+
+# API
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+
+# Планировщик
+apscheduler==3.10.4
+
+# HTTP клиент (для CryptoBot и TON)
+aiohttp==3.9.5
+
+# Утилиты
+python-dotenv==1.0.1
