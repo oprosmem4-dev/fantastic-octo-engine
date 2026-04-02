@@ -1,0 +1,11 @@
+aiogram==3.7.0
+telethon==1.36.0
+sqlalchemy[asyncio]==2.0.30
+asyncpg==0.29.0
+apscheduler==3.10.4
+fastapi==0.111.0
+uvicorn==0.29.0
+alembic==1.13.1
+python-dotenv==1.0.1
+aiohttp==3.9.5
+pydantic==2.7.1
