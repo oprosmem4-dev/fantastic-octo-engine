@@ -35,7 +35,7 @@ async def sign_in(
 async def get_accounts(db: AsyncSession, user_id: int) -> list[Account]:
     result = await db.execute(
         select(Account).where(
-            (Account.owner_id == user_id) | (Account.is_system == True)
+            (Account.owner_id == user_id) | Account.is_system
         )
     )
     return list(result.scalars().all())
@@ -50,7 +50,7 @@ async def get_user_accounts(db: AsyncSession, user_id: int) -> list[Account]:
 
 async def get_system_accounts(db: AsyncSession) -> list[Account]:
     result = await db.execute(
-        select(Account).where(Account.is_system == True, Account.is_active == True, Account.is_banned == False)
+        select(Account).where(Account.is_system, Account.is_active, ~Account.is_banned)
     )
     return list(result.scalars().all())
 

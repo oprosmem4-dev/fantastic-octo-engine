@@ -59,7 +59,7 @@ async def run_task(task_id: int) -> None:
     async with SessionLocal() as db:
         result = await db.execute(
             select(Task)
-            .where(Task.id == task_id, Task.is_active == True)
+            .where(Task.id == task_id, Task.is_active)
             .options(selectinload(Task.accounts), selectinload(Task.chats))
         )
         task = result.scalar_one_or_none()
@@ -91,7 +91,7 @@ async def run_task(task_id: int) -> None:
 
 async def sync_tasks() -> None:
     async with SessionLocal() as db:
-        result = await db.execute(select(Task).where(Task.is_active == True))
+        result = await db.execute(select(Task).where(Task.is_active))
         active_tasks = list(result.scalars().all())
 
     active_ids = {t.id for t in active_tasks}

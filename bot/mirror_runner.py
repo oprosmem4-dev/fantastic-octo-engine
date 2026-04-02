@@ -43,7 +43,7 @@ async def sync_mirrors() -> None:
         try:
             async with SessionLocal() as db:
                 result = await db.execute(
-                    select(MirrorBot).where(MirrorBot.is_active == True)
+                    select(MirrorBot).where(MirrorBot.is_active)
                 )
                 mirrors = list(result.scalars().all())
 
