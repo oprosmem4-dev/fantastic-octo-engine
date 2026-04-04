@@ -132,6 +132,21 @@ def kb_confirm_chats() -> InlineKeyboardMarkup:
     builder.adjust(1)
     return builder.as_markup()
 
+
+def kb_choose_sender(accounts: list[Account]) -> InlineKeyboardMarkup:
+    """Клавиатура выбора аккаунта-отправителя при создании задачи."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🤖 Системные аккаунты", callback_data="tasks:sender:system")
+    for acc in accounts:
+        icon = "✅" if acc.is_active else "⏸"
+        builder.button(
+            text=f"{icon} {acc.phone}",
+            callback_data=f"tasks:sender:acc:{acc.id}"
+        )
+    builder.button(text="❌ Отмена", callback_data="menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
 # ── Админ ─────────────────────────────────────────────────────────────────────
 
 def kb_admin_menu() -> InlineKeyboardMarkup:
