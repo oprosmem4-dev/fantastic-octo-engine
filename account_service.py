@@ -5,7 +5,19 @@ services/account_service.py — управление Telegram-аккаунтам
 import logging
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import (
+    SessionPasswordNeededError,
+    ChannelPrivateError,
+    InviteHashExpiredError,
+    UserBannedInChannelError,
+    ChatWriteForbiddenError,
+    SlowModeWaitError,
+    FloodWaitError,
+    UserAlreadyParticipantError,
+    InviteRequestSentError,
+    ChannelsTooMuchError,
+    PeerIdInvalidError,
+)
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -156,21 +168,117 @@ async def get_chats_from_folder(client: TelegramClient, folder_link: str) -> lis
 
 async def can_write_to_chat(client: TelegramClient, chat_id: str) -> tuple[bool, str]:
     """
-    Проверяет, может ли аккаунт писать в чат, БЕЗ реальной отправки сообщения.
+    Проверяет, может ли аккаунт писать в чат (без реальной отправки).
+    Если аккаунт не участник публичного чата — пробует вступить.
     Возвращает (can_write: bool, reason: str).
     """
-    from telethon.tl.functions.channels import GetParticipantRequest
-    from telethon.errors import ChatWriteForbiddenError, UserBannedInChannelError, ChannelPrivateError
+    from telethon.tl.functions.channels import JoinChannelRequest
+    from telethon.tl.functions.messages import ImportChatInviteRequest
+
+    # Шаг 1: разрезолвить entity
+    entity = None
     try:
-        entity = await client.get_entity(...)
-        # Для каналов — проверить rights через get_permissions
+        if not chat_id.lstrip("-").isdigit():
+            entity = await client.get_entity(f"@{chat_id}")
+        else:
+            try:
+                entity = await client.get_entity(int(chat_id))
+            except (ValueError, PeerIdInvalidError):
+                n = int(chat_id)
+                if n > 0:
+                    entity = await client.get_entity(int(f"-100{n}"))
+    except ChannelPrivateError:
+        return False, "private"
+    except (PeerIdInvalidError, ValueError):
+        return False, "invalid_id"
+    except Exception as e:
+        return False, str(e)
+
+    if entity is None:
+        return False, "not_found"
+
+    # Шаг 2: если это invite-ссылка (https://t.me/+hash) — пробуем вступить через неё
+    if chat_id.startswith("https://t.me/+"):
+        invite_hash = chat_id.rstrip("/").split("+")[-1]
+        try:
+            await client(ImportChatInviteRequest(invite_hash))
+        except UserAlreadyParticipantError:
+            pass
+        except InviteHashExpiredError:
+            return False, "invite_expired"
+        except ChannelsTooMuchError:
+            return False, "too_many_channels"
+        except InviteRequestSentError:
+            return False, "join_pending"
+        except Exception as e:
+            return False, str(e)
+
+    # Шаг 3: для каналов/супергрупп с username — пробуем вступить если нет членства
+    else:
+        has_username = bool(getattr(entity, "username", None))
+        if has_username:
+            try:
+                await client(JoinChannelRequest(entity))
+            except UserAlreadyParticipantError:
+                pass
+            except ChannelsTooMuchError:
+                return False, "too_many_channels"
+            except InviteRequestSentError:
+                return False, "join_pending"
+            except Exception as join_err:
+                log.warning("Не удалось вступить в чат %s: %s", chat_id, join_err)
+
+    # Шаг 4: broadcast-канал — обычные участники не могут писать
+    if getattr(entity, "broadcast", False):
+        return False, "broadcast_channel"
+
+    # Шаг 5: проверить права через get_permissions
+    try:
         perms = await client.get_permissions(entity)
         if perms.send_messages:
             return True, "ok"
         return False, "no_send_permission"
-    except (ChatWriteForbiddenError, UserBannedInChannelError):
+    except UserBannedInChannelError:
         return False, "banned"
-    except ChannelPrivateError:
-        return False, "private"
+    except ChatWriteForbiddenError:
+        return False, "write_forbidden"
+    except SlowModeWaitError:
+        return True, "ok"  # slow mode — писать можно, просто с ограничением
+    except FloodWaitError:
+        return True, "ok"  # flood wait — временное ограничение, не бан
     except Exception as e:
         return False, str(e)
+
+
+async def check_and_join_chats(
+    client: TelegramClient,
+    chats: list[dict],
+) -> list[dict]:
+    """
+    Проверить доступ аккаунта ко всем чатам и попытаться вступить при необходимости.
+
+    Принимает список {"id": str, "title": str}.
+    Возвращает список {"id", "title", "can_write": bool, "reason": str, "link": str|None}.
+    """
+    results = []
+    for chat in chats:
+        chat_id = str(chat["id"])
+        title = chat.get("title", chat_id)
+
+        # Формируем ссылку для отображения пользователю
+        if chat_id.lstrip("-").isdigit():
+            link = None
+        elif chat_id.startswith("https://t.me/"):
+            link = chat_id
+        else:
+            link = f"https://t.me/{chat_id}"
+
+        can_write, reason = await can_write_to_chat(client, chat_id)
+        results.append({
+            "id": chat_id,
+            "title": title,
+            "can_write": can_write,
+            "reason": reason,
+            "link": link,
+        })
+    return results
