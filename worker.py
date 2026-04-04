@@ -154,6 +154,12 @@ async def send_via_account(db: AsyncSession, ta: TaskAccount, message: str):
             log.warning("Аккаунт %s не авторизован", account.phone)
             return
 
+        # Загружаем диалоги, чтобы заполнить кэш сущностей Telethon.
+        # StringSession использует MemorySession — кэш пуст при каждом
+        # новом подключении, поэтому get_entity(int) без этого вызова
+        # всегда падает с ValueError для числовых ID чатов.
+        await client.get_dialogs()
+
         # Шлём в каждый чат
         for chat_id in chat_ids:
             await send_to_chat(db, client, account, ta.task_id, chat_id, message)
