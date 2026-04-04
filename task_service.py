@@ -38,6 +38,7 @@ async def create_task(
     message: str,
     interval_minutes: int,
     chats: list[dict],
+    preferred_account_id: int | None = None,
 ) -> dict | None:
     """
     Создать задачу. Возвращает dict а не ORM объект —
@@ -66,7 +67,7 @@ async def create_task(
             chat_title=chat.get("title", ""),
         ))
 
-    await _distribute_chats(db, task, user, chats)
+    await _distribute_chats(db, task, user, chats, preferred_account_id=preferred_account_id)
     await db.commit()
 
     # Возвращаем dict — не трогаем ORM объект после commit
@@ -100,15 +101,26 @@ async def toggle_task(db: AsyncSession, task_id: int, user_id: int) -> bool | No
     return task.is_active
 
 
-async def _distribute_chats(db, task, user, chats):
-    result = await db.execute(
-        select(Account).where(
-            Account.is_active == True,
-            Account.is_banned == False,
-        ).where(
-            (Account.owner_id == user.id) | (Account.is_system == True)
-        ).order_by(Account.chats_count.asc())
-    )
+async def _distribute_chats(db, task, user, chats, preferred_account_id: int | None = None):
+    if preferred_account_id is not None:
+        # Пользователь выбрал конкретный аккаунт
+        result = await db.execute(
+            select(Account).where(
+                Account.id == preferred_account_id,
+                Account.is_active == True,
+                Account.is_banned == False,
+            )
+        )
+    else:
+        # Системные или личные аккаунты (текущая логика)
+        result = await db.execute(
+            select(Account).where(
+                Account.is_active == True,
+                Account.is_banned == False,
+            ).where(
+                (Account.owner_id == user.id) | (Account.is_system == True)
+            ).order_by(Account.chats_count.asc())
+        )
     accounts = list(result.scalars().all())
 
     if not accounts:

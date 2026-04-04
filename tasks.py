@@ -13,7 +13,8 @@ from models import User
 from services import task_service, account_service
 from bot.keyboards import (
     kb_tasks, kb_task_detail, kb_task_delete_confirm,
-    kb_cancel, kb_back_to_menu, kb_confirm_chats
+    kb_cancel, kb_back_to_menu, kb_confirm_chats,
+    kb_choose_sender
 )
 
 log = logging.getLogger(__name__)
@@ -26,6 +27,7 @@ class CreateTask(StatesGroup):
     message  = State()
     interval = State()
     chats    = State()
+    sender   = State()
 
 
 # ── Отмена FSM — ДОЛЖНА БЫТЬ ПЕРВОЙ ──────────────────────────────────────────
@@ -250,28 +252,58 @@ async def got_task_chats(message: Message, state: FSMContext, user: User, db: As
     if len(chats) > user.max_chats:
         chats = chats[:user.max_chats]
 
-    # Сохраняем и показываем подтверждение
+    # Сохраняем чаты
     await state.update_data(chats=chats)
 
     preview = "\n".join(f"• {c['title']}" for c in chats[:10])
     if len(chats) > 10:
         preview += f"\n... и ещё {len(chats) - 10}"
 
+    # Загружаем аккаунты пользователя для выбора отправителя
+    accounts = await account_service.get_accounts(db, owner_id=user.id)
+
     await message.answer(
         f"✅ Найдено чатов: *{len(chats)}*\n\n"
         f"{preview}\n\n"
+        f"*Шаг 5/5* — Выберите, кто будет отправлять сообщения:",
+        reply_markup=kb_choose_sender(accounts),
+        parse_mode="Markdown"
+    )
+    await state.set_state(CreateTask.sender)
+
+@router.callback_query(CreateTask.sender, F.data.startswith("tasks:sender:"))
+async def got_sender_choice(query: CallbackQuery, state: FSMContext, user: User, db: AsyncSession):
+    choice = query.data  # "tasks:sender:system" или "tasks:sender:acc:123"
+
+    if choice == "tasks:sender:system":
+        await state.update_data(sender_account_id=None)
+        sender_text = "🤖 Системные аккаунты"
+    else:
+        account_id = int(choice.split(":")[-1])
+        await state.update_data(sender_account_id=account_id)
+        acc = await account_service.get_account_by_id(db, account_id)
+        sender_text = f"👤 {acc.phone}" if acc else "👤 Выбранный аккаунт"
+
+    data = await state.get_data()
+    chats = data.get("chats", [])
+
+    await query.message.edit_text(
+        f"✅ Отправитель: *{sender_text}*\n\n"
+        f"📋 Задача: *{data['name']}*\n"
+        f"📬 Чатов: *{len(chats)}*\n"
+        f"⏱ Каждые {data['interval']} мин.\n\n"
         f"Нажмите *Продолжить* для создания задачи:",
         reply_markup=kb_confirm_chats(),
         parse_mode="Markdown"
     )
-    # Остаёмся в состоянии chats — ждём нажатия кнопки
+    # Остаёмся в состоянии sender — ждём нажатия "Продолжить"
+
 
 # СТАЛО:
 @router.callback_query(F.data == "tasks:confirm_chats")
 async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db: AsyncSession):
     data = await state.get_data()
     chats = data.get("chats", [])
-
     if not chats:
         await query.answer("❌ Чаты не найдены.", show_alert=True)
         return
@@ -284,6 +316,7 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
         message=data["message"],
         interval_minutes=data["interval"],
         chats=chats,
+        preferred_account_id=data.get("sender_account_id"),
     )
 
     if not task:
