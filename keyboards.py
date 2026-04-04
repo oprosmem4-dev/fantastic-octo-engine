@@ -124,6 +124,15 @@ def kb_back_to_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="◀️ Меню", callback_data="menu")
     ]])
+
+
+def kb_access_error() -> InlineKeyboardMarkup:
+    """Кнопки после неудачной проверки доступа к чатам."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📋 К задачам", callback_data="tasks:list")
+    builder.button(text="◀️ Меню",     callback_data="menu")
+    builder.adjust(1)
+    return builder.as_markup()
 def kb_confirm_chats() -> InlineKeyboardMarkup:
     """Кнопка подтверждения после ввода чатов."""
     builder = InlineKeyboardBuilder()
