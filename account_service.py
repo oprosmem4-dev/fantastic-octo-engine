@@ -183,7 +183,7 @@ async def can_write_to_chat(client: TelegramClient, chat_id: str) -> tuple[bool,
         else:
             try:
                 entity = await client.get_entity(int(chat_id))
-            except Exception:
+            except (ValueError, PeerIdInvalidError):
                 n = int(chat_id)
                 if n > 0:
                     entity = await client.get_entity(int(f"-100{n}"))
@@ -197,8 +197,8 @@ async def can_write_to_chat(client: TelegramClient, chat_id: str) -> tuple[bool,
     if entity is None:
         return False, "not_found"
 
-    # Шаг 2: если это invite-ссылка (t.me/+hash) — пробуем вступить через неё
-    if chat_id.startswith("https://t.me/+") or chat_id.startswith("t.me/+"):
+    # Шаг 2: если это invite-ссылка (https://t.me/+hash) — пробуем вступить через неё
+    if chat_id.startswith("https://t.me/+"):
         invite_hash = chat_id.rstrip("/").split("+")[-1]
         try:
             await client(ImportChatInviteRequest(invite_hash))
@@ -225,8 +225,8 @@ async def can_write_to_chat(client: TelegramClient, chat_id: str) -> tuple[bool,
                 return False, "too_many_channels"
             except InviteRequestSentError:
                 return False, "join_pending"
-            except Exception:
-                pass  # не критично — проверим права дальше
+            except Exception as join_err:
+                log.warning("Не удалось вступить в чат %s: %s", chat_id, join_err)
 
     # Шаг 4: broadcast-канал — обычные участники не могут писать
     if getattr(entity, "broadcast", False):

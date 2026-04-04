@@ -340,8 +340,12 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
         results = await account_service.check_and_join_chats(client, chats)
     except Exception as e:
         log.error("Ошибка при проверке доступа к чатам: %s", e)
-        results = [{"id": c["id"], "title": c.get("title", c["id"]),
-                    "can_write": True, "reason": "ok", "link": None} for c in chats]
+        await state.clear()
+        await query.message.edit_text(
+            "❌ Не удалось проверить доступ к чатам.\nПопробуйте позже или обратитесь к администратору.",
+            reply_markup=kb_back_to_menu()
+        )
+        return
     finally:
         await client.disconnect()
 
