@@ -14,7 +14,7 @@ from services import task_service, account_service
 from bot.keyboards import (
     kb_tasks, kb_task_detail, kb_task_delete_confirm,
     kb_cancel, kb_back_to_menu, kb_confirm_chats,
-    kb_choose_sender
+    kb_choose_sender, kb_access_error
 )
 
 log = logging.getLogger(__name__)
@@ -299,7 +299,6 @@ async def got_sender_choice(query: CallbackQuery, state: FSMContext, user: User,
     # Остаёмся в состоянии sender — ждём нажатия "Продолжить"
 
 
-# СТАЛО:
 @router.callback_query(F.data == "tasks:confirm_chats")
 async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db: AsyncSession):
     data = await state.get_data()
@@ -308,15 +307,77 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
         await query.answer("❌ Чаты не найдены.", show_alert=True)
         return
 
+    # Определяем аккаунт для проверки (тот же, что будет отправлять)
+    sender_account_id = data.get("sender_account_id")
+    check_account = None
+    if sender_account_id is not None:
+        check_account = await account_service.get_account_by_id(db, sender_account_id)
+    else:
+        accounts = await account_service.get_accounts(db, owner_id=user.id)
+        if not accounts:
+            accounts = await account_service.get_accounts(db)
+        if accounts:
+            check_account = accounts[0]
+
+    if check_account is None:
+        await state.clear()
+        await query.message.edit_text(
+            "❌ Нет доступных аккаунтов для проверки.\nДобавьте аккаунт в /accounts",
+            reply_markup=kb_back_to_menu()
+        )
+        return
+
+    # Уведомляем пользователя о начале проверки
+    await query.message.edit_text(
+        f"🔍 Проверяю доступ к {len(chats)} чатам...\nЭто может занять несколько секунд.",
+        parse_mode="Markdown"
+    )
+
+    # Выполняем проверку через Telethon
+    client = account_service.make_client(check_account)
+    try:
+        await client.connect()
+        results = await account_service.check_and_join_chats(client, chats)
+    except Exception as e:
+        log.error("Ошибка при проверке доступа к чатам: %s", e)
+        results = [{"id": c["id"], "title": c.get("title", c["id"]),
+                    "can_write": True, "reason": "ok", "link": None} for c in chats]
+    finally:
+        await client.disconnect()
+
+    accessible   = [r for r in results if r["can_write"]]
+    inaccessible = [r for r in results if not r["can_write"]]
+
+    # Случай: ни один чат недоступен
+    if not accessible:
+        await state.clear()
+        lines = []
+        for r in inaccessible[:20]:
+            reason_text = _reason_label(r["reason"])
+            link_part = f" — [ссылка]({r['link']})" if r.get("link") else ""
+            lines.append(f"• {r['title']} — {reason_text}{link_part}")
+        inaccessible_list = "\n".join(lines)
+        await query.message.edit_text(
+            f"❌ *Аккаунт не может писать ни в один из указанных чатов.*\n\n"
+            f"Причины:\n{inaccessible_list}",
+            reply_markup=kb_access_error(),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+        return
+
     await state.clear()
+
+    # Формируем финальный список чатов (только доступные)
+    final_chats = [{"id": r["id"], "title": r["title"]} for r in accessible]
 
     task = await task_service.create_task(
         db, user,
         name=data["name"],
         message=data["message"],
         interval_minutes=data["interval"],
-        chats=chats,
-        preferred_account_id=data.get("sender_account_id"),
+        chats=final_chats,
+        preferred_account_id=sender_account_id,
     )
 
     if not task:
@@ -326,9 +387,35 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
         )
         return
 
-    # task теперь dict — обращаемся через []  а не через .
+    # Случай: часть чатов недоступна
+    if inaccessible:
+        lines = []
+        for r in inaccessible[:20]:
+            reason_text = _reason_label(r["reason"])
+            link_part = f" — [ссылка]({r['link']})" if r.get("link") else ""
+            lines.append(f"• {r['title']} — {reason_text}{link_part}")
+        if len(inaccessible) > 20:
+            lines.append(f"... и ещё {len(inaccessible) - 20}")
+        inaccessible_list = "\n".join(lines)
+        await query.message.edit_text(
+            f"⚠️ *Задача создана частично*\n\n"
+            f"✅ Доступно: *{len(accessible)}* из *{len(results)}* чатов\n\n"
+            f"❌ Недоступные чаты:\n{inaccessible_list}\n\n"
+            f"📋 {task['name']}\n"
+            f"📬 Чатов: {task['chats_count']}\n"
+            f"⏱ Каждые {task['interval_minutes']} мин.",
+            reply_markup=kb_back_to_menu(),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+        log.info("Создана задача %d для user %d (%d/%d чатов доступны)",
+                 task['id'], user.id, len(accessible), len(results))
+        return
+
+    # Случай: все чаты доступны
     await query.message.edit_text(
         f"✅ *Задача создана!*\n\n"
+        f"🔓 Доступ ко всем {len(accessible)} чатам подтверждён\n\n"
         f"📋 {task['name']}\n"
         f"📬 Чатов: {task['chats_count']}\n"
         f"⏱ Каждые {task['interval_minutes']} мин.",
@@ -336,3 +423,23 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
         parse_mode="Markdown"
     )
     log.info("Создана задача %d для user %d", task['id'], user.id)
+
+
+def _reason_label(reason: str) -> str:
+    """Человекочитаемое описание причины недоступности чата."""
+    labels = {
+        "private":            "приватный чат (нет ссылки)",
+        "private_no_link":    "приватный чат (нет invite-ссылки)",
+        "invite_expired":     "invite-ссылка устарела",
+        "banned":             "аккаунт заблокирован в чате",
+        "write_forbidden":    "нет прав писать",
+        "no_send_permission": "нет разрешения отправлять",
+        "broadcast_channel":  "broadcast-канал (только админы пишут)",
+        "too_many_channels":  "аккаунт состоит в слишком многих чатах",
+        "join_pending":       "заявка на вступление отправлена",
+        "not_found":          "чат не найден",
+        "invalid_id":         "неверный ID чата",
+    }
+    return labels.get(reason, reason)
+
+
