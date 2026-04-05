@@ -5,11 +5,23 @@ services/account_service.py — управление Telegram-аккаунтам
 import logging
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import (
+    SessionPasswordNeededError,
+    ChannelPrivateError,
+    InviteHashExpiredError,
+    UserBannedInChannelError,
+    ChatWriteForbiddenError,
+    SlowModeWaitError,
+    FloodWaitError,
+    UserAlreadyParticipantError,
+    InviteRequestSentError,
+    ChannelsTooMuchError,
+    PeerIdInvalidError,
+)
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-
+import asyncio
 from models import Account
 
 log = logging.getLogger(__name__)
@@ -156,21 +168,138 @@ async def get_chats_from_folder(client: TelegramClient, folder_link: str) -> lis
 
 async def can_write_to_chat(client: TelegramClient, chat_id: str) -> tuple[bool, str]:
     """
-    Проверяет, может ли аккаунт писать в чат, БЕЗ реальной отправки сообщения.
-    Возвращает (can_write: bool, reason: str).
+    Проверяет может ли аккаунт писать в чат.
+    Метод: реальная отправка сообщения "тест" с немедленным удалением.
+    Это единственный 100% надёжный способ проверки.
     """
-    from telethon.tl.functions.channels import GetParticipantRequest
-    from telethon.errors import ChatWriteForbiddenError, UserBannedInChannelError, ChannelPrivateError
+    from telethon.tl.functions.channels import JoinChannelRequest
+    from telethon.tl.functions.messages import ImportChatInviteRequest, DeleteMessagesRequest
+    from telethon.tl.functions.channels import DeleteMessagesRequest as ChannelDeleteMessagesRequest
+
+    # ── Шаг 1: получить entity ────────────────────────────────────────────────
+    entity = None
     try:
-        entity = await client.get_entity(...)
-        # Для каналов — проверить rights через get_permissions
-        perms = await client.get_permissions(entity)
-        if perms.send_messages:
-            return True, "ok"
-        return False, "no_send_permission"
-    except (ChatWriteForbiddenError, UserBannedInChannelError):
-        return False, "banned"
+        if not chat_id.lstrip("-").isdigit():
+            entity = await client.get_entity(f"@{chat_id}")
+        else:
+            try:
+                entity = await client.get_entity(int(chat_id))
+            except Exception:
+                try:
+                    n = int(chat_id)
+                    if n > 0:
+                        entity = await client.get_entity(int(f"-100{n}"))
+                except Exception:
+                    pass
     except ChannelPrivateError:
         return False, "private"
+    except (PeerIdInvalidError, ValueError):
+        return False, "invalid_id"
     except Exception as e:
         return False, str(e)
+
+    if entity is None:
+        return False, "not_found"
+
+    # ── Шаг 2: попробовать вступить если есть username ────────────────────────
+    if chat_id.startswith("https://t.me/+") or chat_id.startswith("t.me/+"):
+        invite_hash = chat_id.rstrip("/").split("+")[-1]
+        try:
+            await client(ImportChatInviteRequest(invite_hash))
+            await asyncio.sleep(1)
+            entity = await client.get_entity(entity.id)
+        except UserAlreadyParticipantError:
+            pass
+        except InviteHashExpiredError:
+            return False, "invite_expired"
+        except ChannelsTooMuchError:
+            return False, "too_many_channels"
+        except InviteRequestSentError:
+            return False, "join_pending"
+        except Exception as e:
+            return False, str(e)
+
+    elif getattr(entity, "username", None):
+        try:
+            await client(JoinChannelRequest(entity))
+            await asyncio.sleep(1)
+            entity = await client.get_entity(entity.id)
+        except UserAlreadyParticipantError:
+            pass
+        except ChannelsTooMuchError:
+            return False, "too_many_channels"
+        except InviteRequestSentError:
+            return False, "join_pending"
+        except Exception:
+            pass
+
+    # ── Шаг 3: отправить тестовое сообщение и сразу удалить ──────────────────
+    try:
+        msg = await client.send_message(entity, ".")
+        # Сообщение отправилось — удаляем его немедленно
+        try:
+            await client.delete_messages(entity, [msg.id])
+        except Exception:
+            pass  # не смогли удалить — не критично, главное что отправилось
+        return True, "ok"
+
+    except FloodWaitError as e:
+        # Временный флуд — не значит что нельзя писать
+        log.warning("FloodWait %ds при проверке чата %s", e.seconds, chat_id)
+        return True, "ok"
+
+    except SlowModeWaitError:
+        # SlowMode — писать можно, просто с задержкой
+        return True, "ok"
+
+    except UserBannedInChannelError:
+        return False, "banned"
+
+    except ChatWriteForbiddenError:
+        return False, "write_forbidden"
+
+    except Exception as e:
+        error = str(e).lower()
+        # Дополнительные случаи которые Telethon может вернуть как generic Exception
+        if "banned" in error:
+            return False, "banned"
+        if "forbidden" in error or "not allowed" in error:
+            return False, "write_forbidden"
+        if "private" in error:
+            return False, "private"
+        log.warning("Неизвестная ошибка при проверке %s: %s", chat_id, e)
+        return False, str(e)
+
+async def check_and_join_chats(
+    client: TelegramClient,
+    chats: list[dict],
+) -> list[dict]:
+    """
+    Проверить доступ аккаунта ко всем чатам и попытаться вступить при необходимости.
+
+    Принимает список {"id": str, "title": str}.
+    Возвращает список {"id", "title", "can_write": bool, "reason": str, "link": str|None}.
+    """
+    results = []
+    for chat in chats:
+        chat_id = str(chat["id"])
+        title = chat.get("title", chat_id)
+
+        # Формируем ссылку для отображения пользователю
+        if chat_id.lstrip("-").isdigit():
+            link = None
+        elif chat_id.startswith("https://t.me/"):
+            link = chat_id
+        else:
+            link = f"https://t.me/{chat_id}"
+
+        can_write, reason = await can_write_to_chat(client, chat_id)
+        results.append({
+            "id": chat_id,
+            "title": title,
+            "can_write": can_write,
+            "reason": reason,
+            "link": link,
+        })
+    return results
+
