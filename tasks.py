@@ -2,6 +2,7 @@
 bot/handlers/tasks.py — создание и управление задачами рассылок.
 """
 import logging
+import json
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -72,18 +73,56 @@ async def view_task(query: CallbackQuery, state: FSMContext, user: User, db: Asy
     if not task:
         await query.answer("Задача не найдена.", show_alert=True)
         return
+
     icon = "▶️" if task.is_active else "⏸"
-    # Считаем длину через len — selectinload уже загрузил их
-    chats_count = len(task.chats)
-    accounts_count = len(task.accounts)
+
+    # 1) Список чатов задачи
+    chats_lines = []
+    for c in task.chats[:15]:
+        title = (c.chat_title or c.chat_id).strip()
+        status = "" if c.is_ok else " (⚠️ проблемы)"
+        chats_lines.append(f"• {title} `{c.chat_id}`{status}")
+    chats_block = "\n".join(chats_lines) if chats_lines else "—"
+    if len(task.chats) > 15:
+        chats_block += f"\n…и ещё {len(task.chats) - 15}"
+
+    # 2) Какие аккаунты и какие чаты за ними закреплены
+    acc_lines = []
+    for link in task.accounts:
+        # link.chat_ids хранится как JSON-строка
+        try:
+            ids = json.loads(link.chat_ids) if link.chat_ids else []
+        except Exception:
+            ids = []
+
+        acc = getattr(link, "account", None)
+        if acc:
+            acc_name = acc.phone
+            if acc.is_system:
+                acc_name += " (system)"
+        else:
+            acc_name = f"account_id={link.account_id}"
+
+        # показываем до 10 чатов на аккаунт
+        shown = ids[:10]
+        tail = f" …+{len(ids) - 10}" if len(ids) > 10 else ""
+        chats_for_acc = ", ".join(f"`{x}`" for x in shown) + tail if ids else "—"
+        acc_lines.append(f"• {acc_name}: {chats_for_acc}")
+
+    accounts_block = "\n".join(acc_lines) if acc_lines else "—"
+
     text = (
         f"{icon} *{task.name}*\n\n"
         f"💬 Сообщение:\n_{task.message[:200]}_\n\n"
         f"⏱ Интервал: каждые {task.interval_minutes} мин.\n"
-        f"📬 Чатов: {chats_count}\n"
-        f"🤖 Аккаунтов: {accounts_count}"
+        f"📬 Чатов: {len(task.chats)}\n"
+        f"🤖 Аккаунтов: {len(task.accounts)}\n\n"
+        f"🏷 *Чаты рассылки:*\n{chats_block}\n\n"
+        f"👤 *Распределение по аккаунтам:*\n{accounts_block}"
     )
+
     await query.message.edit_text(text, reply_markup=kb_task_detail(task), parse_mode="Markdown")
+
 
 @router.callback_query(F.data.startswith("tasks:toggle:"))
 async def toggle_task(query: CallbackQuery, state: FSMContext, user: User, db: AsyncSession):
@@ -413,12 +452,16 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
         return
 
     # Случай: все чаты доступны
+    preview = "\n".join(f"• {c.get('title') or c.get('id')}" for c in chats[:10])
+    if len(chats) > 10:
+        preview += f"\n…и ещё {len(chats) - 10}"
+
     await query.message.edit_text(
         f"✅ *Задача создана!*\n\n"
-        f"🔓 Доступ ко всем {len(accessible)} чатам подтверждён\n\n"
         f"📋 {task['name']}\n"
         f"📬 Чатов: {task['chats_count']}\n"
-        f"⏱ Каждые {task['interval_minutes']} мин.",
+        f"⏱ Каждые {task['interval_minutes']} мин.\n\n"
+        f"🏷 *Чаты рассылки:*\n{preview}",
         reply_markup=kb_back_to_menu(),
         parse_mode="Markdown"
     )
@@ -441,5 +484,3 @@ def _reason_label(reason: str) -> str:
         "invalid_id":         "неверный ID чата",
     }
     return labels.get(reason, reason)
-
-
