@@ -15,13 +15,15 @@ log = logging.getLogger(__name__)
 async def get_tasks(db: AsyncSession, user_id: int) -> list[Task]:
     result = await db.execute(
         select(Task)
-        .options(selectinload(Task.chats), selectinload(Task.accounts))
+        .options(
+            selectinload(Task.chats),
+            selectinload(Task.accounts).selectinload(TaskAccount.account),
+        )
         .where(Task.user_id == user_id)
         .order_by(Task.created_at.desc())
     )
     return list(result.scalars().all())
-
-
+    
 async def get_task(db: AsyncSession, task_id: int, user_id: int) -> Task | None:
     result = await db.execute(
         select(Task)
@@ -136,3 +138,4 @@ async def _distribute_chats(db, task, user, chats, preferred_account_id: int | N
         acc = accounts[i]
         db.add(TaskAccount(task_id=task.id, account_id=acc.id, chat_ids=json.dumps(chunk)))
         acc.chats_count += len(chunk)
+
