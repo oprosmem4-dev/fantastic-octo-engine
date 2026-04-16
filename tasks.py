@@ -9,7 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery
 from sqlalchemy.ext.asyncio import AsyncSession
-
+from typing import Any
 from models import User
 from services import task_service, account_service
 from bot.keyboards import (
@@ -225,7 +225,83 @@ async def got_task_name(message: Message, state: FSMContext):
 
 @router.message(CreateTask.message)
 async def got_task_message(message: Message, state: FSMContext):
-    await state.update_data(message=message.text)
+    """
+    Шаг 2/4 — контент рассылки:
+    - либо обычный текст
+    - либо 1..5 фото (возможно альбом) + подпись (caption)
+    Важно: фото храним как file_id, форматирование текста храним как entities.
+    """
+    text, entities_json = _extract_text_and_entities(message)
+
+    # Собираем фото из сообщения.
+    # В aiogram photo = список Size, берем последнее (самое большое).
+    photo_file_ids: list[str] = []
+    if message.photo:
+        photo_file_ids.append(message.photo[-1].file_id)
+
+    # Если пользователь прислал альбом, в aiogram это обычно несколько сообщений
+    # с одинаковым media_group_id. В рамках "не усложнять":
+    # - просим присылать альбом одним сообщением/пачкой
+    # - и собираем фотки через простейший буфер в state (см. ниже)
+    #
+    # Реализация: если media_group_id есть — складываем в state и ждём, пока пользователь нажмёт "Продолжить".
+    media_group_id = getattr(message, "media_group_id", None)
+    if media_group_id:
+        data = await state.get_data()
+        mg = data.get("media_group", {"id": media_group_id, "photos": [], "text": "", "entities": []})
+
+        # если начался новый альбом — перезаписываем
+        if mg.get("id") != media_group_id:
+            mg = {"id": media_group_id, "photos": [], "text": "", "entities": []}
+
+        if message.photo:
+            mg["photos"].append(message.photo[-1].file_id)
+
+        # подпись обычно приходит только у одного элемента альбома (часто у первого)
+        if text:
+            mg["text"] = text
+            mg["entities"] = entities_json
+
+        await state.update_data(media_group=mg)
+
+        # Лимит
+        if len(mg["photos"]) > 5:
+            await state.update_data(media_group=None)
+            await message.answer("❌ Фоток должно быть <= 5. Пришлите альбом заново или текст без фото.")
+            return
+
+        await message.answer(
+            f"📸 Принял фото: {len(mg['photos'])}/5.\n"
+            f"Если это всё — отправьте любое сообщение 'ок' (или нажмите дальше по шагам), либо добавьте ещё фото в этот альбом."
+        )
+        # Остаёмся в том же состоянии CreateTask.message
+        return
+
+    # Есл�� это НЕ альбом, но одиночное фото — проверяем лимит 1..5 (здесь максимум 1)
+    if len(photo_file_ids) > 5:
+        await message.answer("❌ Фоток должно быть <= 5.")
+        return
+
+    # Если это просто "ок" после альбома — забираем album из state
+    data = await state.get_data()
+    mg = data.get("media_group")
+    if (message.text or "").strip().lower() in {"ок", "ok", "да", "done"} and mg and mg.get("photos"):
+        text = mg.get("text", "")
+        entities_json = mg.get("entities", [])
+        photo_file_ids = mg.get("photos", [])
+        await state.update_data(media_group=None)
+
+    # Если ни текста, ни фото — просим повторить
+    if not text and not photo_file_ids:
+        await message.answer("❌ Пришлите текст сообщения или фото (до 5) с подписью.")
+        return
+
+    await state.update_data(
+        message=text,
+        format_entities=entities_json,
+        photo_file_ids=photo_file_ids,
+    )
+
     await message.answer(
         "*Шаг 3/4* — Введите интервал в минутах:\n\n"
         "Минимум: *5 минут*\n"
@@ -235,7 +311,6 @@ async def got_task_message(message: Message, state: FSMContext):
         parse_mode="Markdown"
     )
     await state.set_state(CreateTask.interval)
-
 
 @router.message(CreateTask.interval)
 async def got_task_interval(message: Message, state: FSMContext):
@@ -413,10 +488,12 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
     task = await task_service.create_task(
         db, user,
         name=data["name"],
-        message=data["message"],
+        message=data.get("message", ""),
         interval_minutes=data["interval"],
         chats=final_chats,
         preferred_account_id=sender_account_id,
+        photo_file_ids=data.get("photo_file_ids", []),
+        format_entities=data.get("format_entities", []),
     )
 
     if not task:
@@ -466,7 +543,42 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
         parse_mode="Markdown"
     )
     log.info("Создана задача %d для user %d", task['id'], user.id)
+def _entities_to_json(entities) -> list[dict[str, Any]]:
+    """
+    Aiogram entities -> JSON-совместимый список.
+    Храним только то, что нужно для восстановления форматирования.
+    """
+    if not entities:
+        return []
+    out: list[dict[str, Any]] = []
+    for e in entities:
+        d = {
+            "type": e.type,
+            "offset": e.offset,
+            "length": e.length,
+        }
+        # Для text_link (и иногда других) важен url
+        url = getattr(e, "url", None)
+        if url:
+            d["url"] = url
+        out.append(d)
+    return out
 
+
+def _extract_text_and_entities(msg: Message) -> tuple[str, list[dict[str, Any]]]:
+    """
+    Достаём текст и entities из Message:
+    - если пользователь прислал текст -> msg.text + msg.entities
+    - если прислал фото/альбом с подписью -> msg.caption + msg.caption_entities
+    """
+    if msg.caption is not None:
+        text = msg.caption
+        ents = _entities_to_json(msg.caption_entities)
+        return text, ents
+
+    text = msg.text or ""
+    ents = _entities_to_json(msg.entities)
+    return text, ents
 
 def _reason_label(reason: str) -> str:
     """Человекочитаемое описание причины недоступности чата."""
