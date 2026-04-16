@@ -8,15 +8,20 @@ worker/worker.py — воркер рассылок.
   4. Обрабатывает ошибки (FloodWait, бан, нет доступа)
 """
 import asyncio
+import hashlib
 import json
 import logging
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 from sqlalchemy.orm import selectinload
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from telethon.errors import FloodWaitError, UserBannedInChannelError, ChatWriteForbiddenError
 from telethon.tl import types as tl_types
+from aiogram import Bot
+from config import BOT_TOKEN
 from database import SessionLocal, create_all_tables
 from models import Task, TaskAccount, Account, Log
 from services.account_service import make_client
@@ -116,15 +121,16 @@ async def run_task(task_id: int):
             return
 
         # Отправляем через каждый аккаунт в его чаты
-        for ta in task_accounts:
-            await send_via_account(db, ta, task)
+        async with Bot(token=BOT_TOKEN) as bot:
+            for ta in task_accounts:
+                await send_via_account(db, ta, task, bot)
 
         # Обновляем время последнего запуска
         task.last_run_at = datetime.now(timezone.utc)
         await db.commit()
 
 
-async def send_via_account(db: AsyncSession, ta: TaskAccount, task: Task):
+async def send_via_account(db: AsyncSession, ta: TaskAccount, task: Task, bot: Bot):
     result = await db.execute(select(Account).where(Account.id == ta.account_id))
     account = result.scalar_one_or_none()
 
@@ -160,6 +166,7 @@ async def send_via_account(db: AsyncSession, ta: TaskAccount, task: Task):
                 message_text=message_text,
                 photo_file_ids=photo_file_ids,
                 entities_json=format_entities_json,
+                bot=bot,
             )
             await asyncio.sleep(2)
     except Exception as e:
@@ -167,19 +174,35 @@ async def send_via_account(db: AsyncSession, ta: TaskAccount, task: Task):
     finally:
         await client.disconnect()
 
-    message_text = task.message or ""
-    photo_file_ids = []
-    format_entities_json = []
+async def download_photo_files(bot: Bot, photo_file_ids: list[str]) -> list[str]:
+    """
+    Скачать фото по aiogram file_id и сохранить как локальные файлы.
+    Возвращает список путей к локальным файлам.
+    """
+    local_paths = []
+    temp_dir = Path(tempfile.gettempdir()) / "tg_photos"
+    temp_dir.mkdir(exist_ok=True)
 
-    try:
-        photo_file_ids = json.loads(task.photo_file_ids or "[]")
-    except Exception:
-        photo_file_ids = []
+    for file_id in photo_file_ids:
+        try:
+            safe_name = hashlib.md5(file_id.encode()).hexdigest()
+            temp_path = temp_dir / f"{safe_name}.jpg"
+            await bot.download(file_id, destination=str(temp_path))
+            local_paths.append(str(temp_path))
+        except Exception as e:
+            log.error("Ошибка скачивания фото %s: %s", file_id, e)
 
-    try:
-        format_entities_json = json.loads(task.format_entities or "[]")
-    except Exception:
-        format_entities_json = []
+    return local_paths
+
+
+def cleanup_temp_files(file_paths: list[str]) -> None:
+    """Удалить временные файлы после отправки."""
+    for path in file_paths:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except Exception as e:
+            log.warning("Не удалось удалить файл %s: %s", path, e)
+
 
 async def send_to_chat(
     db: AsyncSession,
@@ -190,6 +213,7 @@ async def send_to_chat(
     message_text: str,
     photo_file_ids: list[str],
     entities_json: list[dict],
+    bot: Bot | None = None,
 ):
     """
     Отправить одно сообщение в один чат.
@@ -198,22 +222,38 @@ async def send_to_chat(
     success = False
     error_text = None
 
+    # Скачиваем фото заранее, чтобы Telethon работал с локальными файлами
+    photo_file_ids = photo_file_ids or []
+    local_photo_paths: list[str] = []
+    if photo_file_ids:
+        if bot is None:
+            log.error("Невозможно отправить фото: объект bot не передан в send_to_chat")
+        else:
+            local_photo_paths = await download_photo_files(bot, photo_file_ids)
+
     try:
         entity = await resolve_entity(client, chat_id)
         if entity is None:
             error_text = "не удалось найти чат"
         else:
             entities = _to_telethon_entities(entities_json)
-            photo_file_ids = photo_file_ids or []
 
-            if photo_file_ids:
+            if local_photo_paths:
                 await client.send_file(
                     entity,
-                    file=photo_file_ids,
+                    file=local_photo_paths,
                     caption=message_text or "",
                     formatting_entities=entities if entities else None,
                 )
+            elif not photo_file_ids:
+                await client.send_message(
+                    entity,
+                    message_text or "",
+                    formatting_entities=entities if entities else None,
+                )
             else:
+                # Фото не удалось скачать — отправляем только текст
+                log.warning("Фото не скачаны, отправляю только текст в %s", chat_id)
                 await client.send_message(
                     entity,
                     message_text or "",
@@ -230,12 +270,11 @@ async def send_to_chat(
             entity = await resolve_entity(client, chat_id)
             if entity:
                 entities = _to_telethon_entities(entities_json)
-                photo_file_ids = photo_file_ids or []
 
-                if photo_file_ids:
+                if local_photo_paths:
                     await client.send_file(
                         entity,
-                        file=photo_file_ids,
+                        file=local_photo_paths,
                         caption=message_text or "",
                         formatting_entities=entities if entities else None,
                     )
@@ -257,6 +296,9 @@ async def send_to_chat(
     except Exception as e:
         error_text = str(e)
         log.error("Ошибка отправки в %s: %s", chat_id, e)
+
+    finally:
+        cleanup_temp_files(local_photo_paths)
 
     db.add(Log(
         task_id=task_id,
