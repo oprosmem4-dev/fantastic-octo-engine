@@ -127,7 +127,19 @@ class Task(Base):
     user_id: Mapped[int]      = mapped_column(BigInteger, ForeignKey("users.id"))
     name: Mapped[str]         = mapped_column(String(128), default="Задача")
     message: Mapped[str]      = mapped_column(Text)          # текст для отправки
+
+
+    # NEW: фото для задачи (храним file_id из Telegram, не файлы)
+    # JSON-строка: ["AgACAgIAAxkBAA...","AgACAgIAAxkBAA..."]
+    photo_file_ids: Mapped[str] = mapped_column(Text, default="[]")
+
+    # NEW: форматирование текста (entities)
+    # JSON-строка: [{"type":"bold","offset":0,"length":10}, ...]
+    format_entities: Mapped[str] = mapped_column(Text, default="[]")
+
     interval_minutes: Mapped[int] = mapped_column(Integer, default=60)
+    # ...
+
     is_active: Mapped[bool]   = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -200,3 +212,4 @@ class Log(Base):
     success: Mapped[bool]   = mapped_column(Boolean)
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+
