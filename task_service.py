@@ -41,6 +41,8 @@ async def create_task(
     interval_minutes: int,
     chats: list[dict],
     preferred_account_id: int | None = None,
+    photo_file_ids: list[str] | None = None,
+    format_entities: list[dict] | None = None,
 ) -> dict | None:
     """
     Создать задачу. Возвращает dict а не ORM объект —
@@ -57,6 +59,8 @@ async def create_task(
         user_id=user.id,
         name=name,
         message=message,
+        photo_file_ids=json.dumps(photo_file_ids or [], ensure_ascii=False),
+        format_entities=json.dumps(format_entities or [], ensure_ascii=False),
         interval_minutes=interval_minutes,
     )
     db.add(task)
