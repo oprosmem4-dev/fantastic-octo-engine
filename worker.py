@@ -16,7 +16,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from telethon.errors import FloodWaitError, UserBannedInChannelError, ChatWriteForbiddenError
-
+from telethon.tl import types as tl_types
 from database import SessionLocal, create_all_tables
 from models import Task, TaskAccount, Account, Log
 from services.account_service import make_client
@@ -117,26 +117,20 @@ async def run_task(task_id: int):
 
         # Отправляем через каждый аккаунт в его чаты
         for ta in task_accounts:
-            await send_via_account(db, ta, task.message)
+            await send_via_account(db, ta, task)
 
         # Обновляем время последнего запуска
         task.last_run_at = datetime.now(timezone.utc)
         await db.commit()
 
 
-async def send_via_account(db: AsyncSession, ta: TaskAccount, message: str):
-    """
-    Отправить сообщение через один аккаунт в его список чатов.
-    """
-    # Получаем аккаунт из БД
+async def send_via_account(db: AsyncSession, ta: TaskAccount, task: Task):
     result = await db.execute(select(Account).where(Account.id == ta.account_id))
     account = result.scalar_one_or_none()
 
     if not account or not account.is_active or account.is_banned:
-        log.warning("Аккаунт %d недоступен", ta.account_id)
         return
 
-    # Список чатов для этого аккаунта
     try:
         chat_ids: list[str] = json.loads(ta.chat_ids)
     except Exception:
@@ -145,32 +139,47 @@ async def send_via_account(db: AsyncSession, ta: TaskAccount, message: str):
     if not chat_ids:
         return
 
-    # Создаём Telethon-клиент
+    # ✅ СЮДА — до try/connect
+    message_text = task.message or ""
+    try:
+        photo_file_ids = json.loads(task.photo_file_ids or "[]")
+    except Exception:
+        photo_file_ids = []
+    try:
+        format_entities_json = json.loads(task.format_entities or "[]")
+    except Exception:
+        format_entities_json = []
+
     client = make_client(account)
     try:
         await client.connect()
-
-        if not await client.is_user_authorized():
-            log.warning("Аккаунт %s не авторизован", account.phone)
-            return
-
-        # Загружаем диалоги, чтобы заполнить кэш сущностей Telethon.
-        # StringSession использует MemorySession — кэш пуст при каждом
-        # новом подключении, поэтому get_entity(int) без этого вызова
-        # всегда падает с ValueError для числовых ID чатов.
-        await client.get_dialogs()
-
-        # Шлём в каждый чат
+        ...
         for chat_id in chat_ids:
-            await send_to_chat(db, client, account, ta.task_id, chat_id, message)
-            # Небольшая пауза между сообщениями чтобы не получить FloodWait
+            await send_to_chat(
+                db, client, account, ta.task_id, chat_id,
+                message_text=message_text,
+                photo_file_ids=photo_file_ids,
+                entities_json=format_entities_json,
+            )
             await asyncio.sleep(2)
-
     except Exception as e:
         log.error("Ошибка аккаунта %s: %s", account.phone, e)
     finally:
         await client.disconnect()
 
+    message_text = task.message or ""
+    photo_file_ids = []
+    format_entities_json = []
+
+    try:
+        photo_file_ids = json.loads(task.photo_file_ids or "[]")
+    except Exception:
+        photo_file_ids = []
+
+    try:
+        format_entities_json = json.loads(task.format_entities or "[]")
+    except Exception:
+        format_entities_json = []
 
 async def send_to_chat(
     db: AsyncSession,
@@ -178,7 +187,9 @@ async def send_to_chat(
     account: Account,
     task_id: int,
     chat_id: str,
-    message: str,
+    message_text: str,
+    photo_file_ids: list[str],
+    entities_json: list[dict],
 ):
     """
     Отправить одно сообщение в один чат.
@@ -188,29 +199,58 @@ async def send_to_chat(
     error_text = None
 
     try:
-        # Пытаемся получить entity (чат/канал)
         entity = await resolve_entity(client, chat_id)
         if entity is None:
             error_text = "не удалось найти чат"
         else:
-            await client.send_message(entity, message)
+            entities = _to_telethon_entities(entities_json)
+            photo_file_ids = photo_file_ids or []
+
+            if photo_file_ids:
+                await client.send_file(
+                    entity,
+                    file=photo_file_ids,
+                    caption=message_text or "",
+                    formatting_entities=entities if entities else None,
+                )
+            else:
+                await client.send_message(
+                    entity,
+                    message_text or "",
+                    formatting_entities=entities if entities else None,
+                )
+
             success = True
             log.info("✓ [%s] → %s", account.phone, chat_id)
 
     except FloodWaitError as e:
-        # Telegram просит подождать — ждём и пробуем снова
         log.warning("FloodWait %d сек. для %s", e.seconds, account.phone)
         await asyncio.sleep(e.seconds)
         try:
             entity = await resolve_entity(client, chat_id)
             if entity:
-                await client.send_message(entity, message)
+                entities = _to_telethon_entities(entities_json)
+                photo_file_ids = photo_file_ids or []
+
+                if photo_file_ids:
+                    await client.send_file(
+                        entity,
+                        file=photo_file_ids,
+                        caption=message_text or "",
+                        formatting_entities=entities if entities else None,
+                    )
+                else:
+                    await client.send_message(
+                        entity,
+                        message_text or "",
+                        formatting_entities=entities if entities else None,
+                    )
+
                 success = True
         except Exception as retry_err:
             error_text = str(retry_err)
 
     except (UserBannedInChannelError, ChatWriteForbiddenError) as e:
-        # Бан или нет прав писать
         error_text = f"нет доступа: {type(e).__name__}"
         log.warning("Нет доступа к %s через %s", chat_id, account.phone)
 
@@ -218,7 +258,6 @@ async def send_to_chat(
         error_text = str(e)
         log.error("Ошибка отправки в %s: %s", chat_id, e)
 
-    # Логируем результат в БД
     db.add(Log(
         task_id=task_id,
         account_id=account.id,
@@ -228,6 +267,47 @@ async def send_to_chat(
     ))
     await db.commit()
 
+def _to_telethon_entities(entities_json: list[dict]) -> list:
+    """
+    JSON entities -> telethon.tl.types.MessageEntity*
+    Поддержим базовые форматирования: bold/italic/underline/strikethrough/code/pre/spoiler/blockquote/text_link.
+    Остальное просто проигнорируем (текст уйдёт без этой части форматирования).
+    """
+    out = []
+    for e in entities_json or []:
+        t = (e.get("type") or "").lower()
+        offset = int(e.get("offset", 0))
+        length = int(e.get("length", 0))
+
+        try:
+            if t == "bold":
+                out.append(tl_types.MessageEntityBold(offset=offset, length=length))
+            elif t == "italic":
+                out.append(tl_types.MessageEntityItalic(offset=offset, length=length))
+            elif t == "underline":
+                out.append(tl_types.MessageEntityUnderline(offset=offset, length=length))
+            elif t in {"strikethrough", "strike"}:
+                out.append(tl_types.MessageEntityStrike(offset=offset, length=length))
+            elif t == "spoiler":
+                out.append(tl_types.MessageEntitySpoiler(offset=offset, length=length))
+            elif t == "code":
+                out.append(tl_types.MessageEntityCode(offset=offset, length=length))
+            elif t == "pre":
+                # language в aiogram может быть, но у тебя сейчас не сохраняем — можно потом расширить
+                out.append(tl_types.MessageEntityPre(offset=offset, length=length, language=""))
+            elif t in {"blockquote", "quote"}:
+                out.append(tl_types.MessageEntityBlockquote(offset=offset, length=length))
+            elif t == "text_link":
+                url = e.get("url")
+                if url:
+                    out.append(tl_types.MessageEntityTextUrl(offset=offset, length=length, url=url))
+            else:
+                # неизвестный entity — пропускаем
+                pass
+        except Exception:
+            # на всякий случай не ломаем отправку
+            pass
+    return out
 
 async def resolve_entity(client, chat_id: str):
     """Найти чат по ID или username."""
