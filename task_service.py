@@ -1,12 +1,15 @@
 """
 services/task_service.py — управление задачами рассылок.
+
+ИЗМЕНЕНО: Убрано ограничение MAX_CHATS_PER_ACCOUNT.
+Теперь все чаты одной задачи назначаются первому доступному аккаунту.
 """
 import json
 import logging
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
-from config import MAX_CHATS_PER_USER, MAX_CHATS_PER_ACCOUNT
+from config import MAX_CHATS_PER_USER
 from models import Task, TaskChat, TaskAccount, Account, User, Log
 
 log = logging.getLogger(__name__)
@@ -92,7 +95,7 @@ async def delete_task(db: AsyncSession, task_id: int, user_id: int) -> bool:
     # Сначала удаляем логи этой задачи, иначе FK не даст удалить Task
     await db.execute(delete(Log).where(Log.task_id == task_id))
 
-# Потом удаляем саму задачу
+    # Потом удаляем саму задачу
     await db.delete(task)
     await db.commit()
     return True
@@ -108,6 +111,12 @@ async def toggle_task(db: AsyncSession, task_id: int, user_id: int) -> bool | No
 
 
 async def _distribute_chats(db, task, user, chats, preferred_account_id: int | None = None):
+    """
+    Распределить чаты по аккаунтам.
+    
+    ИЗМЕНЕНО: Теперь без ограничения MAX_CHATS_PER_ACCOUNT.
+    Все чаты назначаются одному аккаунту (или выбранному, или первому доступному).
+    """
     if preferred_account_id is not None:
         # Пользователь выбрал конкретный аккаунт
         result = await db.execute(
@@ -117,8 +126,9 @@ async def _distribute_chats(db, task, user, chats, preferred_account_id: int | N
                 Account.is_banned == False,
             )
         )
+        accounts = list(result.scalars().all())
     else:
-        # Системные или личные аккаунты (текущая логика)
+        # Системные или личные аккаунты (упорядочены по нагрузке)
         result = await db.execute(
             select(Account).where(
                 Account.is_active == True,
@@ -127,19 +137,23 @@ async def _distribute_chats(db, task, user, chats, preferred_account_id: int | N
                 (Account.owner_id == user.id) | (Account.is_system == True)
             ).order_by(Account.chats_count.asc())
         )
-    accounts = list(result.scalars().all())
+        accounts = list(result.scalars().all())
 
     if not accounts:
         log.warning("Нет доступных аккаунтов для задачи %d", task.id)
         return
 
+    # Преобразуем чаты в список ID
     chat_ids = [str(c["id"]) for c in chats]
-    chunks = [chat_ids[i:i + MAX_CHATS_PER_ACCOUNT] for i in range(0, len(chat_ids), MAX_CHATS_PER_ACCOUNT)]
 
-    for i, chunk in enumerate(chunks):
-        if i >= len(accounts):
-            break
-        acc = accounts[i]
-        db.add(TaskAccount(task_id=task.id, account_id=acc.id, chat_ids=json.dumps(chunk)))
-        acc.chats_count += len(chunk)
-
+    # Назначаем ВСЕ чаты первому доступному аккаунту
+    acc = accounts[0]
+    db.add(TaskAccount(
+        task_id=task.id,
+        account_id=acc.id,
+        chat_ids=json.dumps(chat_ids)
+    ))
+    acc.chats_count += len(chat_ids)
+    
+    log.info("Задача %d: назначено %d чатов аккаунту %s",
+             task.id, len(chat_ids), acc.phone)
