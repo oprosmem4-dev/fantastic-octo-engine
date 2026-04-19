@@ -93,7 +93,7 @@ async def run_task(task_id: int):
     Открывает сессию БД, получает все аккаунты задачи и шлёт сообщения.
     """
     async with SessionLocal() as db:
-    # Получаем задачу
+        # Получаем задачу
         result = await db.execute(
             select(Task)
             .options(selectinload(Task.user))
@@ -103,6 +103,7 @@ async def run_task(task_id: int):
 
         if not task or not task.is_active:
             return  # задача удалена или остановлена
+        
         # Проверяем что у пользователя есть доступ
         if not task.user.has_access:
             log.info("Задача %d: пользователь %d без доступа, пропускаем", task_id, task.user_id)
@@ -121,22 +122,30 @@ async def run_task(task_id: int):
             return
 
         # Отправляем через каждый аккаунт в его чаты
-        async with Bot(token=BOT_TOKEN) as bot:
-            for ta in task_accounts:
-                await send_via_account(db, ta, task, bot)
+        for ta in task_accounts:
+            await send_via_account(db, ta, task)
 
         # Обновляем время последнего запуска
         task.last_run_at = datetime.now(timezone.utc)
         await db.commit()
 
 
-async def send_via_account(db: AsyncSession, ta: TaskAccount, task: Task, bot: Bot):
+async def send_via_account(db: AsyncSession, ta: TaskAccount, task: Task):
+    """
+    Отправить сообщение через один аккаунт в его список чатов.
+    
+    ФИКСИРОВАНО: переменные message_text, photo_file_ids, format_entities_json
+    теперь извлекаются ДО try-блока (раньше были после finally, что вызывало NameError).
+    """
+    # Получаем аккаунт из БД
     result = await db.execute(select(Account).where(Account.id == ta.account_id))
     account = result.scalar_one_or_none()
 
     if not account or not account.is_active or account.is_banned:
+        log.warning("Аккаунт %d недоступен", ta.account_id)
         return
 
+    # Список чатов для этого аккаунта
     try:
         chat_ids: list[str] = json.loads(ta.chat_ids)
     except Exception:
@@ -145,7 +154,7 @@ async def send_via_account(db: AsyncSession, ta: TaskAccount, task: Task, bot: B
     if not chat_ids:
         return
 
-    # ✅ СЮДА — до try/connect
+    # ✅ ФИКСИРОВАНО: извлекаем переменные ДО try-блока
     message_text = task.message or ""
     try:
         photo_file_ids = json.loads(task.photo_file_ids or "[]")
@@ -156,52 +165,35 @@ async def send_via_account(db: AsyncSession, ta: TaskAccount, task: Task, bot: B
     except Exception:
         format_entities_json = []
 
+    # Создаём Telethon-клиент
     client = make_client(account)
     try:
         await client.connect()
-        ...
+
+        if not await client.is_user_authorized():
+            log.warning("Аккаунт %s не авторизован", account.phone)
+            return
+
+        # Загружаем диалоги, чтобы заполнить кэш сущностей Telethon.
+        # StringSession использует MemorySession — кэш пуст при каждом
+        # новом подключении, поэтому get_entity(int) без этого вызова
+        # всегда падает с ValueError для числовых ID чатов.
+        await client.get_dialogs()
+
+        # Шлём в каждый чат
         for chat_id in chat_ids:
             await send_to_chat(
                 db, client, account, ta.task_id, chat_id,
                 message_text=message_text,
                 photo_file_ids=photo_file_ids,
                 entities_json=format_entities_json,
-                bot=bot,
             )
             await asyncio.sleep(2)
+
     except Exception as e:
         log.error("Ошибка аккаунта %s: %s", account.phone, e)
     finally:
         await client.disconnect()
-
-async def download_photo_files(bot: Bot, photo_file_ids: list[str]) -> list[str]:
-    """
-    Скачать фото по aiogram file_id и сохранить как локальные файлы.
-    Возвращает список путей к локальным файлам.
-    """
-    local_paths = []
-    temp_dir = Path(tempfile.gettempdir()) / "tg_photos"
-    temp_dir.mkdir(exist_ok=True)
-
-    for file_id in photo_file_ids:
-        try:
-            safe_name = hashlib.md5(file_id.encode()).hexdigest()
-            temp_path = temp_dir / f"{safe_name}.jpg"
-            await bot.download(file_id, destination=str(temp_path))
-            local_paths.append(str(temp_path))
-        except Exception as e:
-            log.error("Ошибка скачивания фото %s: %s", file_id, e)
-
-    return local_paths
-
-
-def cleanup_temp_files(file_paths: list[str]) -> None:
-    """Удалить временные файлы после отправки."""
-    for path in file_paths:
-        try:
-            Path(path).unlink(missing_ok=True)
-        except Exception as e:
-            log.warning("Не удалось удалить файл %s: %s", path, e)
 
 
 async def send_to_chat(
@@ -213,7 +205,6 @@ async def send_to_chat(
     message_text: str,
     photo_file_ids: list[str],
     entities_json: list[dict],
-    bot: Bot | None = None,
 ):
     """
     Отправить одно сообщение в один чат.
@@ -222,38 +213,22 @@ async def send_to_chat(
     success = False
     error_text = None
 
-    # Скачиваем фото заранее, чтобы Telethon работал с локальными файлами
-    photo_file_ids = photo_file_ids or []
-    local_photo_paths: list[str] = []
-    if photo_file_ids:
-        if bot is None:
-            log.error("Невозможно отправить фото: объект bot не передан в send_to_chat")
-        else:
-            local_photo_paths = await download_photo_files(bot, photo_file_ids)
-
     try:
         entity = await resolve_entity(client, chat_id)
         if entity is None:
             error_text = "не удалось найти чат"
         else:
             entities = _to_telethon_entities(entities_json)
+            photo_file_ids = photo_file_ids or []
 
-            if local_photo_paths:
+            if photo_file_ids:
                 await client.send_file(
                     entity,
-                    file=local_photo_paths,
+                    file=photo_file_ids,
                     caption=message_text or "",
                     formatting_entities=entities if entities else None,
                 )
-            elif not photo_file_ids:
-                await client.send_message(
-                    entity,
-                    message_text or "",
-                    formatting_entities=entities if entities else None,
-                )
             else:
-                # Фото не удалось скачать — отправляем только текст
-                log.warning("Фото не скачаны, отправляю только текст в %s", chat_id)
                 await client.send_message(
                     entity,
                     message_text or "",
@@ -270,11 +245,12 @@ async def send_to_chat(
             entity = await resolve_entity(client, chat_id)
             if entity:
                 entities = _to_telethon_entities(entities_json)
+                photo_file_ids = photo_file_ids or []
 
-                if local_photo_paths:
+                if photo_file_ids:
                     await client.send_file(
                         entity,
-                        file=local_photo_paths,
+                        file=photo_file_ids,
                         caption=message_text or "",
                         formatting_entities=entities if entities else None,
                     )
@@ -297,9 +273,6 @@ async def send_to_chat(
         error_text = str(e)
         log.error("Ошибка отправки в %s: %s", chat_id, e)
 
-    finally:
-        cleanup_temp_files(local_photo_paths)
-
     db.add(Log(
         task_id=task_id,
         account_id=account.id,
@@ -308,6 +281,7 @@ async def send_to_chat(
         error=error_text,
     ))
     await db.commit()
+
 
 def _to_telethon_entities(entities_json: list[dict]) -> list:
     """
@@ -351,6 +325,7 @@ def _to_telethon_entities(entities_json: list[dict]) -> list:
             pass
     return out
 
+
 async def resolve_entity(client, chat_id: str):
     """Найти чат по ID или username."""
     # Попытка 1: напрямую как строка (с @ если username)
@@ -377,6 +352,7 @@ async def resolve_entity(client, chat_id: str):
         pass
 
     return None
+
 
 # ── Фоновая проверка аккаунтов ────────────────────────────────────────────────
 
