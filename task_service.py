@@ -1,8 +1,9 @@
 """
 services/task_service.py — управление задачами рассылок.
 
-ИЗМЕНЕНО: Убрано ограничение MAX_CHATS_PER_ACCOUNT.
-Теперь все чаты одной задачи назначаются первому доступному аккаунту.
+ИСПРАВЛЕНО: get_task и get_tasks теперь загружают account внутри TaskAccount
+через цепочку selectinload(Task.accounts).selectinload(TaskAccount.account)
+— это устраняет MissingGreenlet при обращении к link.account в handlers/tasks.py.
 """
 import json
 import logging
@@ -26,11 +27,15 @@ async def get_tasks(db: AsyncSession, user_id: int) -> list[Task]:
         .order_by(Task.created_at.desc())
     )
     return list(result.scalars().all())
-    
+
+
 async def get_task(db: AsyncSession, task_id: int, user_id: int) -> Task | None:
     result = await db.execute(
         select(Task)
-        .options(selectinload(Task.chats), selectinload(Task.accounts))
+        .options(
+            selectinload(Task.chats),
+            selectinload(Task.accounts).selectinload(TaskAccount.account),
+        )
         .where(Task.id == task_id, Task.user_id == user_id)
     )
     return result.scalar_one_or_none()
@@ -79,7 +84,6 @@ async def create_task(
     await _distribute_chats(db, task, user, chats, preferred_account_id=preferred_account_id)
     await db.commit()
 
-    # Возвращаем dict — не трогаем ORM объект после commit
     return {
         "id": task.id,
         "name": name,
@@ -92,10 +96,7 @@ async def delete_task(db: AsyncSession, task_id: int, user_id: int) -> bool:
     task = await get_task(db, task_id, user_id)
     if not task:
         return False
-    # Сначала удаляем логи этой задачи, иначе FK не даст удалить Task
     await db.execute(delete(Log).where(Log.task_id == task_id))
-
-    # Потом удаляем саму задачу
     await db.delete(task)
     await db.commit()
     return True
@@ -113,26 +114,25 @@ async def toggle_task(db: AsyncSession, task_id: int, user_id: int) -> bool | No
 async def _distribute_chats(db, task, user, chats, preferred_account_id: int | None = None):
     """
     Распределить чаты по аккаунтам.
-    
-    ИЗМЕНЕНО: Теперь без ограничения MAX_CHATS_PER_ACCOUNT.
-    Все чаты назначаются одному аккаунту (или выбранному, или первому доступному).
+    Все чаты назначаются одному аккаунту (выбранному или первому доступному).
+    Аккаунты в спамблоке/заморозке не выбираются.
     """
     if preferred_account_id is not None:
-        # Пользователь выбрал конкретный аккаунт
         result = await db.execute(
             select(Account).where(
                 Account.id == preferred_account_id,
                 Account.is_active == True,
                 Account.is_banned == False,
+                Account.status == "ok",
             )
         )
         accounts = list(result.scalars().all())
     else:
-        # Системные или личные аккаунты (упорядочены по нагрузке)
         result = await db.execute(
             select(Account).where(
                 Account.is_active == True,
                 Account.is_banned == False,
+                Account.status == "ok",
             ).where(
                 (Account.owner_id == user.id) | (Account.is_system == True)
             ).order_by(Account.chats_count.asc())
@@ -143,10 +143,7 @@ async def _distribute_chats(db, task, user, chats, preferred_account_id: int | N
         log.warning("Нет доступных аккаунтов для задачи %d", task.id)
         return
 
-    # Преобразуем чаты в список ID
     chat_ids = [str(c["id"]) for c in chats]
-
-    # Назначаем ВСЕ чаты первому доступному аккаунту
     acc = accounts[0]
     db.add(TaskAccount(
         task_id=task.id,
@@ -154,6 +151,6 @@ async def _distribute_chats(db, task, user, chats, preferred_account_id: int | N
         chat_ids=json.dumps(chat_ids)
     ))
     acc.chats_count += len(chat_ids)
-    
+
     log.info("Задача %d: назначено %d чатов аккаунту %s",
              task.id, len(chat_ids), acc.phone)
