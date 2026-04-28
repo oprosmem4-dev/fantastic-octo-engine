@@ -3,6 +3,7 @@ services/account_service.py — управление Telegram-аккаунтам
 Добавление, авторизация, получение списка, загрузка/выгрузка.
 """
 import logging
+import asyncio
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import (
@@ -21,7 +22,6 @@ from telethon.errors import (
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-import asyncio
 from models import Account
 
 log = logging.getLogger(__name__)
@@ -110,11 +110,32 @@ async def send_code(api_id: int, api_hash: str, phone: str) -> tuple[TelegramCli
     """
     Начать вход: отправить код на телефон.
     Возвращает (client, phone_code_hash) — клиент надо сохранить в user_data.
+    
+    ФИКСИРОВАНО: добавлена задержка после подключения и логирование.
     """
     client = TelegramClient(StringSession(), api_id, api_hash)
-    await client.connect()
-    sent = await client.send_code_request(phone)
-    return client, sent.phone_code_hash
+    log.info("Подключаюсь для отправки кода на %s...", phone)
+    
+    try:
+        await client.connect()
+        log.info("Подключение успешно")
+        
+        # Задержка после подключения — даёт время на синхронизацию с серверами
+        await asyncio.sleep(1)
+        
+        log.info("Отправляю код на %s...", phone)
+        sent = await client.send_code_request(phone)
+        
+        log.info("✅ Код успешно отправлен на %s (hash=%s)", phone, sent.phone_code_hash)
+        return client, sent.phone_code_hash
+        
+    except Exception as e:
+        log.error("❌ Ошибка отправки кода на %s: %s", phone, e)
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        raise
 
 
 async def sign_in_code(
@@ -127,14 +148,20 @@ async def sign_in_code(
     Войти по коду. Если нужен 2FA — бросает SessionPasswordNeededError.
     Возвращает session_string при успехе.
     """
+    log.info("Пытаюсь войти по коду для %s...", phone)
     await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
-    return StringSession.save(client.session)
+    session_str = StringSession.save(client.session)
+    log.info("✅ Успешный вход для %s", phone)
+    return session_str
 
 
 async def sign_in_2fa(client: TelegramClient, password: str) -> str:
     """Войти по паролю 2FA. Возвращает session_string."""
+    log.info("Пытаюсь войти с паролем 2FA...")
     await client.sign_in(password=password)
-    return StringSession.save(client.session)
+    session_str = StringSession.save(client.session)
+    log.info("✅ Успешный вход через 2FA")
+    return session_str
 
 
 async def get_me_name(client: TelegramClient) -> str:
@@ -270,6 +297,7 @@ async def can_write_to_chat(client: TelegramClient, chat_id: str) -> tuple[bool,
         log.warning("Неизвестная ошибка при проверке %s: %s", chat_id, e)
         return False, str(e)
 
+
 async def check_and_join_chats(
     client: TelegramClient,
     chats: list[dict],
@@ -302,4 +330,3 @@ async def check_and_join_chats(
             "link": link,
         })
     return results
-
