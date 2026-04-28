@@ -1,5 +1,10 @@
 """
 bot/keyboards.py — все клавиатуры бота в одном месте.
+
+ИЗМЕНЕНИЯ:
+  - kb_accounts: иконка аккаунта берётся из acc.status_icon
+    ✅ активен | ⏸ приостановлен | ❄️ заморожен | 🚫 спамблок
+  - kb_account_detail: кнопка Toggle скрыта для frozen/spamblocked аккаунтов
 """
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -24,7 +29,6 @@ def kb_main_menu(has_access: bool) -> InlineKeyboardMarkup:
 def kb_subscription_plans(is_mirror: bool = False) -> InlineKeyboardMarkup:
     """Кнопки выбора тарифного плана."""
     if is_mirror:
-        # В зеркале оплата недоступна
         return InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
                 text="💳 Оплатить в главном боте",
@@ -36,7 +40,7 @@ def kb_subscription_plans(is_mirror: bool = False) -> InlineKeyboardMarkup:
     for plan, info in SUBSCRIPTION_PRICES.items():
         label = f"{labels[plan]} — {info['stars']}⭐ / {info['usdt']}$"
         builder.button(text=label, callback_data=f"pay:select:{plan}")
-    builder.button(text="◀️ Назад", callback_data="menu")
+    builder.button(text="◀️ Назад", callback_data="menu:new")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -62,7 +66,7 @@ def kb_tasks(tasks: list[Task]) -> InlineKeyboardMarkup:
             callback_data=f"tasks:view:{t.id}"
         )
     builder.button(text="➕ Новая задача", callback_data="tasks:new")
-    builder.button(text="◀️ Меню",        callback_data="menu")
+    builder.button(text="◀️ Меню",        callback_data="menu:new")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -88,41 +92,61 @@ def kb_task_delete_confirm(task_id: int) -> InlineKeyboardMarkup:
 
 
 def kb_accounts(accounts: list[Account]) -> InlineKeyboardMarkup:
-    """Список аккаунтов пользователя."""
+    """
+    Список аккаунтов пользователя.
+    Иконки:
+      ✅ — активен (status=ok)
+      ⏸ — приостановлен (status=ok, is_active=False)
+      ❄️ — заморожен Telegram (status=frozen)
+      🚫 — спамблок (status=spamblocked)
+    """
     builder = InlineKeyboardBuilder()
     for acc in accounts:
-        icon = "✅" if acc.is_active else "⏸"
+        icon = acc.status_icon  # из свойства модели
         builder.button(
             text=f"{icon} {acc.phone} ({acc.chats_count} чатов)",
             callback_data=f"accounts:view:{acc.id}"
         )
     builder.button(text="➕ Добавить аккаунт", callback_data="accounts:add")
-    builder.button(text="◀️ Меню",             callback_data="menu")
+    builder.button(text="◀️ Меню",             callback_data="menu:new")
     builder.adjust(1)
     return builder.as_markup()
 
 
 def kb_account_detail(acc: Account) -> InlineKeyboardMarkup:
-    """Управление аккаунтом."""
+    """
+    Управление аккаунтом.
+    Для frozen/spamblocked аккаунтов кнопка Toggle скрыта
+    (включать их бессмысленно — нужно сначала устранить ограничение).
+    """
     builder = InlineKeyboardBuilder()
-    toggle_text = "⏸ Отключить" if acc.is_active else "▶️ Включить"
-    builder.button(text=toggle_text,          callback_data=f"accounts:toggle:{acc.id}")
-    builder.button(text="🗑 Удалить",         callback_data=f"accounts:delete:{acc.id}")
-    builder.button(text="◀️ К аккаунтам",    callback_data="accounts:list")
-    builder.adjust(2, 1)
+
+    # Кнопка вкл/выкл только для нормально работающих аккаунтов
+    if acc.status == "ok":
+        toggle_text = "⏸ Отключить" if acc.is_active else "▶️ Включить"
+        builder.button(text=toggle_text, callback_data=f"accounts:toggle:{acc.id}")
+
+    builder.button(text="🗑 Удалить",       callback_data=f"accounts:delete:{acc.id}")
+    builder.button(text="◀️ К аккаунтам",  callback_data="accounts:list")
+
+    if acc.status == "ok":
+        builder.adjust(2, 1)
+    else:
+        builder.adjust(1)
+
     return builder.as_markup()
 
 
 def kb_cancel() -> InlineKeyboardMarkup:
     """Простая кнопка отмены."""
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="❌ Отмена", callback_data="menu")
+        InlineKeyboardButton(text="❌ Отмена", callback_data="menu:new")
     ]])
 
 
 def kb_back_to_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="◀️ Меню", callback_data="menu")
+        InlineKeyboardButton(text="◀️ Меню", callback_data="menu:new")
     ]])
 
 
@@ -130,14 +154,16 @@ def kb_access_error() -> InlineKeyboardMarkup:
     """Кнопки после неудачной проверки доступа к чатам."""
     builder = InlineKeyboardBuilder()
     builder.button(text="📋 К задачам", callback_data="tasks:list")
-    builder.button(text="◀️ Меню",     callback_data="menu")
+    builder.button(text="◀️ Меню",     callback_data="menu:new")
     builder.adjust(1)
     return builder.as_markup()
+
+
 def kb_confirm_chats() -> InlineKeyboardMarkup:
     """Кнопка подтверждения после ввода чатов."""
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Продолжить", callback_data="tasks:confirm_chats")
-    builder.button(text="❌ Отмена",     callback_data="menu")
+    builder.button(text="❌ Отмена",     callback_data="menu:new")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -147,14 +173,18 @@ def kb_choose_sender(accounts: list[Account]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="🤖 Системные аккаунты", callback_data="tasks:sender:system")
     for acc in accounts:
+        # Показываем только рабочие аккаунты — заморожен/спамблок не предлагаем
+        if acc.status != "ok":
+            continue
         icon = "✅" if acc.is_active else "⏸"
         builder.button(
             text=f"{icon} {acc.phone}",
             callback_data=f"tasks:sender:acc:{acc.id}"
         )
-    builder.button(text="❌ Отмена", callback_data="menu")
+    builder.button(text="❌ Отмена", callback_data="menu:new")
     builder.adjust(1)
     return builder.as_markup()
+
 
 # ── Админ ─────────────────────────────────────────────────────────────────────
 
@@ -163,7 +193,6 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
     builder.button(text="👥 Пользователи",   callback_data="admin:users")
     builder.button(text="🤖 Аккаунты",       callback_data="admin:accounts")
     builder.button(text="📊 Статистика",     callback_data="admin:stats")
-    builder.button(text="◀️ Меню",           callback_data="menu")
+    builder.button(text="◀️ Меню",           callback_data="menu:new")
     builder.adjust(2, 1, 1)
     return builder.as_markup()
-
