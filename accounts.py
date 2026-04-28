@@ -1,6 +1,10 @@
 """
 bot/handlers/accounts.py — добавление и управление аккаунтами через FSM.
 
+ИЗМЕНЕНИЯ:
+  - view_account: показывает статус ограничения (frozen/spamblocked) с пояснением
+  - Заблокированные/замороженные аккаунты нельзя включить — кнопка Toggle скрыта
+
 Шаги добавления аккаунта:
   1. api_id
   2. api_hash
@@ -27,10 +31,10 @@ router = Router()
 
 # ── FSM состояния ─────────────────────────────────────────────────────────────
 class AddAccount(StatesGroup):
-    api_id      = State()
-    api_hash    = State()
-    phone       = State()
-    code        = State()
+    api_id       = State()
+    api_hash     = State()
+    phone        = State()
+    code         = State()
     password_2fa = State()
 
 
@@ -59,12 +63,28 @@ async def view_account(query: CallbackQuery, user: User, db: AsyncSession):
         await query.answer("Аккаунт не найден.", show_alert=True)
         return
 
-    status = "✅ Активен" if acc.is_active else "⏸ Остановлен"
+    # ── Блок статуса ─────────────────────────────────────────────────────────
+    status_line = acc.status_label  # из свойства модели
+
+    # Дополнительное пояснение для проблемных аккаунтов
+    restriction_note = ""
+    if acc.status == "frozen":
+        restriction_note = (
+            "\n\n⚠️ *Аккаунт заморожен Telegram-ом.*\n"
+            "Все задачи остановлены. Обратитесь в поддержку Telegram."
+        )
+    elif acc.status == "spamblocked":
+        restriction_note = (
+            "\n\n⚠️ *Аккаунт в спамблоке.*\n"
+            "Рассылки остановлены. Попробуйте снять ограничение через @SpamBot."
+        )
+
     text = (
-        f"🤖 *Аккаунт {acc.phone}*\n\n"
-        f"Статус: {status}\n"
+        f"{acc.status_icon} *Аккаунт {acc.phone}*\n\n"
+        f"Статус: {status_line}\n"
         f"Чатов: {acc.chats_count}\n"
         f"ID: `{acc.id}`"
+        f"{restriction_note}"
     )
     await query.message.edit_text(text, reply_markup=kb_account_detail(acc), parse_mode="Markdown")
 
@@ -76,6 +96,14 @@ async def toggle_account(query: CallbackQuery, user: User, db: AsyncSession):
 
     if not acc or (acc.owner_id != user.id and not user.is_admin):
         await query.answer("Нет доступа.", show_alert=True)
+        return
+
+    # Запрещаем включать замороженные/заспамблоченные аккаунты
+    if acc.status != "ok":
+        await query.answer(
+            f"Невозможно изменить: аккаунт {acc.status_label}",
+            show_alert=True
+        )
         return
 
     acc.is_active = not acc.is_active
@@ -112,8 +140,7 @@ async def start_add_account(query: CallbackQuery, state: FSMContext, user: User)
         "➕ *Добавление аккаунта*\n\n"
         "⚠️ *Важно:*\n"
         "• Не ставьте интервал рассылки < 15 минут\n"
-        "• Не используйте > 30–40 чатов на аккаунт\n"
-        "• Нарушение может привести к бану в Telegram\n\n"
+        "• Нарушение может привести к спамблоку\n\n"
         "*Шаг 1/3* — Введите API\\_ID\n"
         "(получить на [my.telegram.org/apps](https://my.telegram.org/apps))",
         reply_markup=kb_cancel(),
@@ -157,13 +184,10 @@ async def got_phone(message: Message, state: FSMContext):
         client, phone_code_hash = await account_service.send_code(
             data["api_id"], data["api_hash"], phone
         )
-        # Сохраняем клиент в state (временно)
         await state.update_data(
             phone=phone,
             phone_code_hash=phone_code_hash,
-            # Клиент нельзя сохранить в state напрямую — сохраним в глобальный dict
         )
-        # Сохраняем клиент в bot_data по user_id
         message.bot._pending_clients = getattr(message.bot, "_pending_clients", {})
         message.bot._pending_clients[message.from_user.id] = client
 
