@@ -6,9 +6,12 @@ worker/worker.py — воркер рассылок.
   2. Для каждой задачи создаёт (или обновляет) job в APScheduler
   3. Job отправляет сообщения через Telethon-аккаунты
   4. Обрабатывает ошибки (FloodWait, бан, нет доступа)
+
+НОВОЕ: каждые 30 минут запускает run_full_restriction_check() из
+restriction_service — проверяет заморозку, спамблок и доступ к чатам.
+При ошибках отправки в чат также вызывается check_account_on_send_error().
 """
 import asyncio
-import hashlib
 import json
 import logging
 import tempfile
@@ -25,6 +28,7 @@ from config import BOT_TOKEN
 from database import SessionLocal, create_all_tables
 from models import Task, TaskAccount, Account, Log
 from services.account_service import make_client
+from services.restriction_service import check_account_on_send_error
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +38,9 @@ scheduler = AsyncIOScheduler(timezone="UTC")
 # Отслеживаем какие задачи уже загружены и с каким интервалом
 # {task_id: interval_minutes}
 _loaded_tasks: dict[int, int] = {}
+
+# Флаг чтобы не запускать несколько concurrent проверок ограничений
+_restriction_check_running = False
 
 
 # ── Главный цикл ──────────────────────────────────────────────────────────────
@@ -65,24 +72,44 @@ async def sync_tasks():
             existing_interval = _loaded_tasks.get(task.id)
 
             if existing_interval is None:
-                # Новая задача — добавляем
                 scheduler.add_job(
                     run_task,
                     "interval",
                     minutes=task.interval_minutes,
                     id=job_id,
                     args=[task.id],
-                    next_run_time=datetime.now(timezone.utc),  # запустить сразу
+                    next_run_time=datetime.now(timezone.utc),
                     replace_existing=True,
                 )
                 _loaded_tasks[task.id] = task.interval_minutes
                 log.info("Добавлена задача %d (каждые %d мин.)", task.id, task.interval_minutes)
 
             elif existing_interval != task.interval_minutes:
-                # Изменился интервал — перепланируем
                 scheduler.reschedule_job(job_id, trigger="interval", minutes=task.interval_minutes)
                 _loaded_tasks[task.id] = task.interval_minutes
                 log.info("Обновлён интервал задачи %d → %d мин.", task.id, task.interval_minutes)
+
+
+# ── Периодическая проверка ограничений ────────────────────────────────────────
+
+async def check_restrictions():
+    """
+    Запускает полную проверку ограничений аккаунтов (каждые 30 минут).
+    Защита от параллельного запуска через флаг.
+    """
+    global _restriction_check_running
+    if _restriction_check_running:
+        log.debug("Проверка ограничений уже запущена, пропускаем")
+        return
+
+    _restriction_check_running = True
+    try:
+        from services.restriction_service import run_full_restriction_check
+        await run_full_restriction_check()
+    except Exception as e:
+        log.error("Ошибка в check_restrictions: %s", e)
+    finally:
+        _restriction_check_running = False
 
 
 # ── Выполнение одной задачи ───────────────────────────────────────────────────
@@ -93,7 +120,6 @@ async def run_task(task_id: int):
     Открывает сессию БД, получает все аккаунты задачи и шлёт сообщения.
     """
     async with SessionLocal() as db:
-        # Получаем задачу
         result = await db.execute(
             select(Task)
             .options(selectinload(Task.user))
@@ -102,16 +128,14 @@ async def run_task(task_id: int):
         task = result.scalar_one_or_none()
 
         if not task or not task.is_active:
-            return  # задача удалена или остановлена
-        
-        # Проверяем что у пользователя есть доступ
+            return
+
         if not task.user.has_access:
             log.info("Задача %d: пользователь %d без доступа, пропускаем", task_id, task.user_id)
             return
 
         log.info("Запускаю задачу %d (%s)", task_id, task.name)
 
-        # Получаем все аккаунты задачи
         result = await db.execute(
             select(TaskAccount).where(TaskAccount.task_id == task_id)
         )
@@ -121,11 +145,9 @@ async def run_task(task_id: int):
             log.warning("Задача %d: нет аккаунтов", task_id)
             return
 
-        # Отправляем через каждый аккаунт в его чаты
         for ta in task_accounts:
             await send_via_account(db, ta, task)
 
-        # Обновляем время последнего запуска
         task.last_run_at = datetime.now(timezone.utc)
         await db.commit()
 
@@ -133,19 +155,15 @@ async def run_task(task_id: int):
 async def send_via_account(db: AsyncSession, ta: TaskAccount, task: Task):
     """
     Отправить сообщение через один аккаунт в его список чатов.
-    
-    ФИКСИРОВАНО: переменные message_text, photo_file_ids, format_entities_json
-    теперь извлекаются ДО try-блока (раньше были после finally, что вызывало NameError).
     """
-    # Получаем аккаунт из БД
     result = await db.execute(select(Account).where(Account.id == ta.account_id))
     account = result.scalar_one_or_none()
 
-    if not account or not account.is_active or account.is_banned:
-        log.warning("Аккаунт %d недоступен", ta.account_id)
+    if not account or not account.is_active or account.is_banned or account.status != "ok":
+        log.warning("Аккаунт %d недоступен (status=%s)", ta.account_id,
+                    getattr(account, "status", "?") if account else "not found")
         return
 
-    # Список чатов для этого аккаунта
     try:
         chat_ids: list[str] = json.loads(ta.chat_ids)
     except Exception:
@@ -154,7 +172,7 @@ async def send_via_account(db: AsyncSession, ta: TaskAccount, task: Task):
     if not chat_ids:
         return
 
-    # ✅ ФИКСИРОВАНО: извлекаем переменные ДО try-блока
+    # ✅ Извлекаем переменные ДО try-блока
     message_text = task.message or ""
     try:
         photo_file_ids = json.loads(task.photo_file_ids or "[]")
@@ -165,7 +183,6 @@ async def send_via_account(db: AsyncSession, ta: TaskAccount, task: Task):
     except Exception:
         format_entities_json = []
 
-    # Создаём Telethon-клиент
     client = make_client(account)
     try:
         await client.connect()
@@ -174,13 +191,8 @@ async def send_via_account(db: AsyncSession, ta: TaskAccount, task: Task):
             log.warning("Аккаунт %s не авторизован", account.phone)
             return
 
-        # Загружаем диалоги, чтобы заполнить кэш сущностей Telethon.
-        # StringSession использует MemorySession — кэш пуст при каждом
-        # новом подключении, поэтому get_entity(int) без этого вызова
-        # всегда падает с ValueError для числовых ID чатов.
         await client.get_dialogs()
 
-        # Шлём в каждый чат
         for chat_id in chat_ids:
             await send_to_chat(
                 db, client, account, ta.task_id, chat_id,
@@ -208,7 +220,11 @@ async def send_to_chat(
 ):
     """
     Отправить одно сообщение в один чат.
-    Обрабатывает FloodWait и другие ошибки.
+
+    При ошибках:
+    - FloodWait → ждём и повторяем
+    - UserBannedInChannel / ChatWriteForbidden → запускаем проверку ограничений
+    - Прочие ошибки → запускаем проверку ограничений (может быть спамблок)
     """
     success = False
     error_text = None
@@ -219,8 +235,6 @@ async def send_to_chat(
             error_text = "не удалось найти чат"
         else:
             entities = _to_telethon_entities(entities_json)
-            photo_file_ids = photo_file_ids or []
-
             if photo_file_ids:
                 await client.send_file(
                     entity,
@@ -234,7 +248,6 @@ async def send_to_chat(
                     message_text or "",
                     formatting_entities=entities if entities else None,
                 )
-
             success = True
             log.info("✓ [%s] → %s", account.phone, chat_id)
 
@@ -245,8 +258,6 @@ async def send_to_chat(
             entity = await resolve_entity(client, chat_id)
             if entity:
                 entities = _to_telethon_entities(entities_json)
-                photo_file_ids = photo_file_ids or []
-
                 if photo_file_ids:
                     await client.send_file(
                         entity,
@@ -260,18 +271,27 @@ async def send_to_chat(
                         message_text or "",
                         formatting_entities=entities if entities else None,
                     )
-
                 success = True
         except Exception as retry_err:
             error_text = str(retry_err)
+            # FloodWait в ретрае — не триггерим проверку ограничений
+            # (не запускаем asyncio.create_task тут)
 
     except (UserBannedInChannelError, ChatWriteForbiddenError) as e:
         error_text = f"нет доступа: {type(e).__name__}"
         log.warning("Нет доступа к %s через %s", chat_id, account.phone)
+        # ── Запускаем проверку ограничений в фоне ────────────────────────────
+        asyncio.create_task(
+            check_account_on_send_error(account.id, task_id, chat_id, e)
+        )
 
     except Exception as e:
         error_text = str(e)
         log.error("Ошибка отправки в %s: %s", chat_id, e)
+        # ── Запускаем проверку ограничений в фоне (может быть спамблок) ──────
+        asyncio.create_task(
+            check_account_on_send_error(account.id, task_id, chat_id, e)
+        )
 
     db.add(Log(
         task_id=task_id,
@@ -284,17 +304,12 @@ async def send_to_chat(
 
 
 def _to_telethon_entities(entities_json: list[dict]) -> list:
-    """
-    JSON entities -> telethon.tl.types.MessageEntity*
-    Поддержим базовые форматирования: bold/italic/underline/strikethrough/code/pre/spoiler/blockquote/text_link.
-    Остальное просто проигнорируем (текст уйдёт без этой части форматирования).
-    """
+    """JSON entities → telethon.tl.types.MessageEntity*"""
     out = []
     for e in entities_json or []:
         t = (e.get("type") or "").lower()
         offset = int(e.get("offset", 0))
         length = int(e.get("length", 0))
-
         try:
             if t == "bold":
                 out.append(tl_types.MessageEntityBold(offset=offset, length=length))
@@ -309,7 +324,6 @@ def _to_telethon_entities(entities_json: list[dict]) -> list:
             elif t == "code":
                 out.append(tl_types.MessageEntityCode(offset=offset, length=length))
             elif t == "pre":
-                # language в aiogram может быть, но у тебя сейчас не сохраняем — можно потом расширить
                 out.append(tl_types.MessageEntityPre(offset=offset, length=length, language=""))
             elif t in {"blockquote", "quote"}:
                 out.append(tl_types.MessageEntityBlockquote(offset=offset, length=length))
@@ -317,49 +331,38 @@ def _to_telethon_entities(entities_json: list[dict]) -> list:
                 url = e.get("url")
                 if url:
                     out.append(tl_types.MessageEntityTextUrl(offset=offset, length=length, url=url))
-            else:
-                # неизвестный entity — пропускаем
-                pass
         except Exception:
-            # на всякий случай не ломаем отправку
             pass
     return out
 
 
 async def resolve_entity(client, chat_id: str):
     """Найти чат по ID или username."""
-    # Попытка 1: напрямую как строка (с @ если username)
     try:
-        # Если не число — добавляем @ для username
         if not chat_id.lstrip('-').isdigit():
             return await client.get_entity(f"@{chat_id}")
         return await client.get_entity(chat_id)
     except Exception:
         pass
-
-    # Попытка 2: как число
     try:
         return await client.get_entity(int(chat_id))
     except Exception:
         pass
-
-    # Попытка 3: добавить -100 для каналов
     try:
         n = int(chat_id)
         if n > 0:
             return await client.get_entity(int(f"-100{n}"))
     except Exception:
         pass
-
     return None
 
 
-# ── Фоновая проверка аккаунтов ────────────────────────────────────────────────
+# ── Фоновая проверка авторизации аккаунтов ────────────────────────────────────
 
 async def check_accounts():
     """
-    Периодически проверять аккаунты на бан.
-    Запускается раз в час.
+    Периодически проверять аккаунты на бан/разлогин (каждый час).
+    Более поверхностная проверка чем run_full_restriction_check.
     """
     async with SessionLocal() as db:
         result = await db.execute(
@@ -373,6 +376,7 @@ async def check_accounts():
                 await client.connect()
                 if not await client.is_user_authorized():
                     account.is_banned = True
+                    account.status = "frozen"
                     log.warning("Аккаунт %s забанен или разлогинен", account.phone)
                 await client.disconnect()
             except Exception as e:
@@ -389,16 +393,20 @@ async def main():
     # Синхронизация задач каждые 30 секунд
     scheduler.add_job(sync_tasks, "interval", seconds=30, id="__sync__")
 
-    # Проверка аккаунтов раз в час
+    # Проверка авторизации аккаунтов раз в час
     scheduler.add_job(check_accounts, "interval", hours=1, id="__check_accs__")
+
+    # Проверка ограничений (заморозка + спамблок + доступ к чатам) каждые 30 минут
+    scheduler.add_job(check_restrictions, "interval", minutes=30, id="__restrictions__")
 
     scheduler.start()
     log.info("Воркер запущен.")
 
-    # Первый запуск сразу
+    # Первые запуски
     await sync_tasks()
+    # Проверку ограничений запускаем с задержкой, чтобы воркер успел стартовать
+    asyncio.get_event_loop().call_later(60, lambda: asyncio.create_task(check_restrictions()))
 
-    # Держим процесс живым
     while True:
         await asyncio.sleep(60)
 
