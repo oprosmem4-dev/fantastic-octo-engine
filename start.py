@@ -1,8 +1,15 @@
 """
 bot/handlers/start.py — /start, /help, главное меню, статус.
+
+ИЗМЕНЕНО:
+  - callback "menu:new" → отправляет НОВОЕ сообщение с меню (не редактирует).
+    Используется в кнопках kb_back_to_menu() и kb_cancel().
+  - callback "menu" → редактирует текущее сообщение (для внутренних переходов
+    внутри одного флоу, например tasks→menu внутри FSM).
 """
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
+from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, CallbackQuery
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,6 +17,10 @@ from models import User
 from bot.keyboards import kb_main_menu, kb_back_to_menu
 
 router = Router()
+
+
+def _menu_text(user: User) -> str:
+    return f"👋 Главное меню\n{user.subscription_status}"
 
 
 def status_text(user: User) -> str:
@@ -30,7 +41,6 @@ def status_text(user: User) -> str:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, user: User):
-    """Приветствие при /start."""
     greeting = "👋 *Добро пожаловать!*" if len(user.tasks) == 0 else "👋 *С возвращением!*"
     text = (
         f"{greeting}\n\n"
@@ -43,7 +53,6 @@ async def cmd_start(message: Message, user: User):
 
 @router.message(Command("help"))
 async def cmd_help(message: Message, user: User):
-    """Справка."""
     text = (
         "📋 *Команды:*\n\n"
         "/start — главное меню\n"
@@ -64,13 +73,38 @@ async def cmd_status(message: Message, user: User):
 
 # ── Callback-и ────────────────────────────────────────────────────────────────
 
-@router.callback_query(F.data == "menu")
-async def cb_menu(query: CallbackQuery, user: User):
-    """Вернуться в главное меню."""
-    await query.message.edit_text(
-        f"👋 Главное меню\n{user.subscription_status}",
+@router.callback_query(F.data == "menu:new")
+async def cb_menu_new(query: CallbackQuery, state: FSMContext, user: User):
+    """
+    Кнопка «Меню» / «Отмена» — всегда отправляет НОВОЕ сообщение.
+    Предыдущее сообщение (с кнопками) остаётся в истории нетронутым.
+    """
+    # Сбрасываем FSM если был активен
+    current = await state.get_state()
+    if current:
+        await state.clear()
+
+    await query.answer()
+    await query.message.answer(
+        _menu_text(user),
         reply_markup=kb_main_menu(user.has_access),
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+    )
+
+
+@router.callback_query(F.data == "menu")
+async def cb_menu(query: CallbackQuery, state: FSMContext, user: User):
+    """
+    Внутренний переход в меню — редактирует текущее сообщение.
+    Используется для внутренних переходов (например, из payment→menu).
+    """
+    current = await state.get_state()
+    if current:
+        await state.clear()
+    await query.message.edit_text(
+        _menu_text(user),
+        reply_markup=kb_main_menu(user.has_access),
+        parse_mode="Markdown",
     )
 
 
@@ -79,5 +113,5 @@ async def cb_status(query: CallbackQuery, user: User):
     await query.message.edit_text(
         status_text(user),
         reply_markup=kb_back_to_menu(),
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
