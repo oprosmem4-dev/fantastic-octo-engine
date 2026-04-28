@@ -1,5 +1,8 @@
 """
 bot/handlers/tasks.py — создание и управление задачами рассылок.
+
+НОВОЕ: хендлеры tasks:transfer_start и tasks:transfer_pick —
+перенос задачи на другой аккаунт после уведомления об ограничении.
 """
 import logging
 import json
@@ -8,9 +11,10 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Any
-from models import User
+from models import User, Account, TaskAccount
 from services import task_service, account_service
 from bot.keyboards import (
     kb_tasks, kb_task_detail, kb_task_delete_confirm,
@@ -33,14 +37,15 @@ class CreateTask(StatesGroup):
 
 # ── Отмена FSM — ДОЛЖНА БЫТЬ ПЕРВОЙ ──────────────────────────────────────────
 
-@router.callback_query(F.data == "menu")
+@router.callback_query(F.data == "menu:new")
 async def cb_cancel_to_menu(query: CallbackQuery, state: FSMContext, user: User):
-    """Отмена — сбрасываем FSM и возвращаем в меню."""
+    """Отмена FSM — сбрасываем состояние и отправляем НОВОЕ сообщение меню."""
     current = await state.get_state()
     if current:
         await state.clear()
     from bot.keyboards import kb_main_menu
-    await query.message.edit_text(
+    await query.answer()
+    await query.message.answer(
         f"👋 Главное меню\n{user.subscription_status}",
         reply_markup=kb_main_menu(user.has_access),
         parse_mode="Markdown"
@@ -51,7 +56,7 @@ async def cb_cancel_to_menu(query: CallbackQuery, state: FSMContext, user: User)
 
 @router.message(Command("tasks"))
 async def cmd_tasks(message: Message, state: FSMContext, user: User, db: AsyncSession):
-    await state.clear()  # сбрасываем FSM на всякий случай
+    await state.clear()
     tasks = await task_service.get_tasks(db, user.id)
     text = "📋 *Ваши задачи*" if tasks else "📋 У вас пока нет задач."
     await message.answer(text, reply_markup=kb_tasks(tasks), parse_mode="Markdown")
@@ -76,7 +81,6 @@ async def view_task(query: CallbackQuery, state: FSMContext, user: User, db: Asy
 
     icon = "▶️" if task.is_active else "⏸"
 
-    # 1) Список чатов задачи
     chats_lines = []
     for c in task.chats[:15]:
         title = (c.chat_title or c.chat_id).strip()
@@ -86,10 +90,8 @@ async def view_task(query: CallbackQuery, state: FSMContext, user: User, db: Asy
     if len(task.chats) > 15:
         chats_block += f"\n…и ещё {len(task.chats) - 15}"
 
-    # 2) Какие аккаунты и какие чаты за ними закреплены
     acc_lines = []
     for link in task.accounts:
-        # link.chat_ids хранится как JSON-строка
         try:
             ids = json.loads(link.chat_ids) if link.chat_ids else []
         except Exception:
@@ -100,10 +102,12 @@ async def view_task(query: CallbackQuery, state: FSMContext, user: User, db: Asy
             acc_name = acc.phone
             if acc.is_system:
                 acc_name += " (system)"
+            # Показываем статус если есть проблемы
+            if acc.status != "ok":
+                acc_name += f" {acc.status_icon}"
         else:
             acc_name = f"account_id={link.account_id}"
 
-        # показываем до 10 чатов на аккаунт
         shown = ids[:10]
         tail = f" …+{len(ids) - 10}" if len(ids) > 10 else ""
         chats_for_acc = ", ".join(f"`{x}`" for x in shown) + tail if ids else "—"
@@ -137,7 +141,6 @@ async def toggle_task(query: CallbackQuery, state: FSMContext, user: User, db: A
         return
     status = "запущена ▶️" if new_state else "остановлена ⏸"
     await query.answer(f"Задача {status}")
-    # Обновляем карточку задачи
     task = await task_service.get_task(db, task_id, user.id)
     if task:
         icon = "▶️" if task.is_active else "⏸"
@@ -183,7 +186,7 @@ async def confirm_delete_task(query: CallbackQuery, state: FSMContext, user: Use
 
 @router.callback_query(F.data == "tasks:new")
 async def cb_new_task(query: CallbackQuery, state: FSMContext, user: User):
-    await state.clear()  # сбрасываем предыдущий FSM если был
+    await state.clear()
     if not user.has_access:
         await query.answer("⚠️ Нужна активная подписка.", show_alert=True)
         return
@@ -225,46 +228,29 @@ async def got_task_name(message: Message, state: FSMContext):
 
 @router.message(CreateTask.message)
 async def got_task_message(message: Message, state: FSMContext):
-    """
-    Шаг 2/4 — контент рассылки:
-    - либо обычный текст
-    - либо 1..5 фото (возможно альбом) + подпись (caption)
-    Важно: фото храним как file_id, форматирование текста храним как entities.
-    """
     text, entities_json = _extract_text_and_entities(message)
 
-    # Собираем фото из сообщения.
-    # В aiogram photo = список Size, берем последнее (самое большое).
     photo_file_ids: list[str] = []
     if message.photo:
         photo_file_ids.append(message.photo[-1].file_id)
 
-    # Если пользователь прислал альбом, в aiogram это обычно несколько сообщений
-    # с одинаковым media_group_id. В рамках "не усложнять":
-    # - просим присылать альбом одним сообщением/пачкой
-    # - и собираем фотки через простейший буфер в state (см. ниже)
-    #
-    # Реализация: если media_group_id есть — складываем в state и ждём, пока пользователь нажмёт "Продолжить".
     media_group_id = getattr(message, "media_group_id", None)
     if media_group_id:
         data = await state.get_data()
         mg = data.get("media_group", {"id": media_group_id, "photos": [], "text": "", "entities": []})
 
-        # если начался новый альбом — перезаписываем
         if mg.get("id") != media_group_id:
             mg = {"id": media_group_id, "photos": [], "text": "", "entities": []}
 
         if message.photo:
             mg["photos"].append(message.photo[-1].file_id)
 
-        # подпись обычно приходит только у одного элемента альбома (часто у первого)
         if text:
             mg["text"] = text
             mg["entities"] = entities_json
 
         await state.update_data(media_group=mg)
 
-        # Лимит
         if len(mg["photos"]) > 5:
             await state.update_data(media_group=None)
             await message.answer("❌ Фоток должно быть <= 5. Пришлите альбом заново или текст без фото.")
@@ -272,17 +258,14 @@ async def got_task_message(message: Message, state: FSMContext):
 
         await message.answer(
             f"📸 Принял фото: {len(mg['photos'])}/5.\n"
-            f"Если это всё — отправьте любое сообщение 'ок' (или нажмите дальше по шагам), либо добавьте ещё фото в этот альбом."
+            f"Если это всё — отправьте 'ок' или добавьте ещё фото."
         )
-        # Остаёмся в том же состоянии CreateTask.message
         return
 
-    # Есл�� это НЕ альбом, но одиночное фото — проверяем лимит 1..5 (здесь максимум 1)
     if len(photo_file_ids) > 5:
         await message.answer("❌ Фоток должно быть <= 5.")
         return
 
-    # Если это просто "ок" после альбома — забираем album из state
     data = await state.get_data()
     mg = data.get("media_group")
     if (message.text or "").strip().lower() in {"ок", "ok", "да", "done"} and mg and mg.get("photos"):
@@ -291,7 +274,6 @@ async def got_task_message(message: Message, state: FSMContext):
         photo_file_ids = mg.get("photos", [])
         await state.update_data(media_group=None)
 
-    # Если ни текста, ни фото — просим повторить
     if not text and not photo_file_ids:
         await message.answer("❌ Пришлите текст сообщения или фото (до 5) с подписью.")
         return
@@ -311,6 +293,7 @@ async def got_task_message(message: Message, state: FSMContext):
         parse_mode="Markdown"
     )
     await state.set_state(CreateTask.interval)
+
 
 @router.message(CreateTask.interval)
 async def got_task_interval(message: Message, state: FSMContext):
@@ -337,7 +320,6 @@ async def got_task_chats(message: Message, state: FSMContext, user: User, db: As
     raw = message.text.strip()
     chats = []
 
-    # Вариант 1: папка
     if raw.startswith("https://t.me/addlist/"):
         await message.answer("🔍 Получаю список чатов из папки...")
         accounts = await account_service.get_accounts(db, owner_id=user.id)
@@ -351,8 +333,6 @@ async def got_task_chats(message: Message, state: FSMContext, user: User, db: As
         if not chats:
             await message.answer("❌ Не удалось получить чаты. Попробуйте список вручную:")
             return
-
-    # Вариант 2: список
     else:
         for line in raw.splitlines():
             line = line.strip().lstrip("@")
@@ -366,14 +346,12 @@ async def got_task_chats(message: Message, state: FSMContext, user: User, db: As
     if len(chats) > user.max_chats:
         chats = chats[:user.max_chats]
 
-    # Сохраняем чаты
     await state.update_data(chats=chats)
 
     preview = "\n".join(f"• {c['title']}" for c in chats[:10])
     if len(chats) > 10:
         preview += f"\n... и ещё {len(chats) - 10}"
 
-    # Загружаем аккаунты пользователя для выбора отправителя
     accounts = await account_service.get_accounts(db, owner_id=user.id)
 
     await message.answer(
@@ -385,9 +363,10 @@ async def got_task_chats(message: Message, state: FSMContext, user: User, db: As
     )
     await state.set_state(CreateTask.sender)
 
+
 @router.callback_query(CreateTask.sender, F.data.startswith("tasks:sender:"))
 async def got_sender_choice(query: CallbackQuery, state: FSMContext, user: User, db: AsyncSession):
-    choice = query.data  # "tasks:sender:system" или "tasks:sender:acc:123"
+    choice = query.data
 
     if choice == "tasks:sender:system":
         await state.update_data(sender_account_id=None)
@@ -410,7 +389,6 @@ async def got_sender_choice(query: CallbackQuery, state: FSMContext, user: User,
         reply_markup=kb_confirm_chats(),
         parse_mode="Markdown"
     )
-    # Остаёмся в состоянии sender — ждём нажатия "Продолжить"
 
 
 @router.callback_query(F.data == "tasks:confirm_chats")
@@ -421,7 +399,6 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
         await query.answer("❌ Чаты не найдены.", show_alert=True)
         return
 
-    # Определяем аккаунт для проверки (тот же, что будет отправлять)
     sender_account_id = data.get("sender_account_id")
     check_account = None
     if sender_account_id is not None:
@@ -441,13 +418,11 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
         )
         return
 
-    # Уведомляем пользователя о начале проверки
     await query.message.edit_text(
         f"🔍 Проверяю доступ к {len(chats)} чатам...\nЭто может занять несколько секунд.",
         parse_mode="Markdown"
     )
 
-    # Выполняем проверку через Telethon
     client = account_service.make_client(check_account)
     try:
         await client.connect()
@@ -462,7 +437,6 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
     accessible   = [r for r in results if r["can_write"]]
     inaccessible = [r for r in results if not r["can_write"]]
 
-    # Случай: ни один чат недоступен
     if not accessible:
         await state.clear()
         lines = []
@@ -482,7 +456,6 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
 
     await state.clear()
 
-    # Формируем финальный список чатов (только доступные)
     final_chats = [{"id": r["id"], "title": r["title"]} for r in accessible]
 
     task = await task_service.create_task(
@@ -503,7 +476,6 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
         )
         return
 
-    # Случай: часть чатов недоступна
     if inaccessible:
         lines = []
         for r in inaccessible[:20]:
@@ -524,11 +496,8 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
             parse_mode="Markdown",
             disable_web_page_preview=True,
         )
-        log.info("Создана задача %d для user %d (%d/%d чатов доступны)",
-                 task['id'], user.id, len(accessible), len(results))
         return
 
-    # Случай: все чаты доступны
     preview = "\n".join(f"• {c.get('title') or c.get('id')}" for c in chats[:10])
     if len(chats) > 10:
         preview += f"\n…и ещё {len(chats) - 10}"
@@ -543,21 +512,358 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
         parse_mode="Markdown"
     )
     log.info("Создана задача %d для user %d", task['id'], user.id)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ПЕРЕНОС ЗАДАЧИ НА ДРУГОЙ АККАУНТ (вызывается из уведомления об ограничении)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("tasks:transfer_start:"))
+async def transfer_task_start(query: CallbackQuery, state: FSMContext, user: User, db: AsyncSession):
+    """
+    Шаг 1: пользователь нажал "Перенести рассылку".
+    Проверяем can_write_to_chat для каждого аккаунта ПЕРЕД показом списка.
+    callback_data: tasks:transfer_start:{task_id}:{chat_id}
+    """
+    parts = query.data.split(":", 3)
+    if len(parts) < 4:
+        await query.answer("Ошибка: неверный формат.", show_alert=True)
+        return
+
+    task_id = int(parts[2])
+    chat_id = parts[3]
+
+    task = await task_service.get_task(db, task_id, user.id)
+    if not task:
+        await query.answer("Задача не найдена.", show_alert=True)
+        return
+
+    await query.answer()
+    # Сообщаем что идёт проверка — это может занять время
+    checking_msg = await query.message.answer(
+        "🔍 Проверяю доступ аккаунтов к чату...",
+        parse_mode="Markdown",
+    )
+
+    personal_accounts = await account_service.get_accounts(db, owner_id=user.id)
+    personal_ok = [a for a in personal_accounts if a.status == "ok"]
+
+    # Проверяем каждый личный аккаунт через can_write_to_chat
+    available_personal = []
+    for acc in personal_ok:
+        client = account_service.make_client(acc)
+        try:
+            await client.connect()
+            can_write, reason = await account_service.can_write_to_chat(client, chat_id)
+            if can_write:
+                available_personal.append(acc)
+        except Exception:
+            pass
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+    # Для системных — просто показываем кнопку, проверка будет при выборе
+    # (там слишком много аккаунтов чтобы проверять все заранее)
+
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="🤖 Системные аккаунты",
+        callback_data=f"tasks:transfer_pick:system:{task_id}:{chat_id}",
+    )
+    for acc in available_personal:
+        builder.button(
+            text=f"✅ {acc.phone}",
+            callback_data=f"tasks:transfer_pick:acc:{acc.id}:{task_id}:{chat_id}",
+        )
+    builder.button(text="❌ Отмена", callback_data="menu:new")
+    builder.adjust(1)
+
+    # Удаляем сообщение "проверяю..."
+    try:
+        await checking_msg.delete()
+    except Exception:
+        pass
+
+    no_personal_note = ""
+    if personal_ok and not available_personal:
+        no_personal_note = "\n\n⚠️ Ни один из ваших личных аккаунтов не может писать в этот чат."
+    elif not personal_ok:
+        no_personal_note = "\n\n💡 У вас нет личных аккаунтов. Можно добавить через /accounts."
+
+    await query.message.answer(
+        f"🔄 *Перенос рассылки*\n\n"
+        f"Задача: *{task.name}*\n"
+        f"Чат: `{chat_id}`\n\n"
+        f"Выберите аккаунт для продолжения рассылки:{no_personal_note}",
+        reply_markup=builder.as_markup(),
+        parse_mode="Markdown",
+    )
+
+
+@router.callback_query(F.data.startswith("tasks:transfer_pick:"))
+async def transfer_task_pick(query: CallbackQuery, state: FSMContext, user: User, db: AsyncSession):
+    """
+    Шаг 2: пользователь выбрал аккаунт.
+    - Проверяем can_write_to_chat для выбранного аккаунта.
+    - Если не может писать — показываем ошибку и возвращаем к списку выбора.
+    - Если может — переносим все чаты и запускаем задачу.
+
+    Форматы callback_data:
+      tasks:transfer_pick:system:{task_id}:{chat_id}
+      tasks:transfer_pick:acc:{account_id}:{task_id}:{chat_id}
+    """
+    parts = query.data.split(":")
+
+    if parts[2] == "system":
+        task_id  = int(parts[3])
+        chat_id_check = parts[4]
+        use_system = True
+        new_account_id = None
+    else:
+        # tasks:transfer_pick:acc:{account_id}:{task_id}:{chat_id}
+        new_account_id = int(parts[3])
+        task_id = int(parts[4])
+        chat_id_check = parts[5]
+        use_system = False
+
+    await state.clear()
+
+    task = await task_service.get_task(db, task_id, user.id)
+    if not task:
+        await query.answer("Задача не найдена.", show_alert=True)
+        return
+
+    # ── Вспомогательная функция: показать список выбора заново ───────────────
+    async def _back_to_account_list(error_text: str):
+        """Показать ошибку и вернуть к выбору аккаунта новым сообщением."""
+        await query.answer()
+
+        personal_accounts = await account_service.get_accounts(db, owner_id=user.id)
+        personal_ok = [a for a in personal_accounts if a.status == "ok"]
+
+        # Перепроверяем личные аккаунты (быстро — уже отфильтрованы по статусу)
+        available_personal = []
+        for acc in personal_ok:
+            client = account_service.make_client(acc)
+            try:
+                await client.connect()
+                can_write, _ = await account_service.can_write_to_chat(client, chat_id_check)
+                if can_write:
+                    available_personal.append(acc)
+            except Exception:
+                pass
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+
+        from aiogram.utils.keyboard import InlineKeyboardBuilder
+        builder = InlineKeyboardBuilder()
+        builder.button(
+            text="🤖 Системные аккаунты",
+            callback_data=f"tasks:transfer_pick:system:{task_id}:{chat_id_check}",
+        )
+        for acc in available_personal:
+            builder.button(
+                text=f"✅ {acc.phone}",
+                callback_data=f"tasks:transfer_pick:acc:{acc.id}:{task_id}:{chat_id_check}",
+            )
+        builder.button(text="❌ Отмена", callback_data="menu:new")
+        builder.adjust(1)
+
+        await query.message.answer(
+            f"❌ {error_text}\n\n"
+            f"Выберите другой аккаунт:",
+            reply_markup=builder.as_markup(),
+            parse_mode="Markdown",
+        )
+
+    # ── Определяем и проверяем новый аккаунт ─────────────────────────────────
+    if use_system:
+        # Берём системные по порядку нагрузки, ищем первый который может писать
+        result = await db.execute(
+            select(Account).where(
+                Account.is_system == True,
+                Account.is_active == True,
+                Account.is_banned == False,
+                Account.status == "ok",
+            ).order_by(Account.chats_count.asc())
+        )
+        system_accounts = result.scalars().all()
+
+        if not system_accounts:
+            await _back_to_account_list(
+                "Нет доступных системных аккаунтов.\n"
+                "Попробуйте добавить личный аккаунт через /accounts."
+            )
+            return
+
+        # Проверяем каждый системный пока не найдём рабочий
+        await query.answer()
+        checking_msg = await query.message.answer(
+            "🔍 Проверяю системные аккаунты..."
+        )
+
+        new_acc = None
+        for acc in system_accounts:
+            client = account_service.make_client(acc)
+            try:
+                await client.connect()
+                can_write, reason = await account_service.can_write_to_chat(client, chat_id_check)
+                if can_write:
+                    new_acc = acc
+                    break
+            except Exception:
+                pass
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+
+        try:
+            await checking_msg.delete()
+        except Exception:
+            pass
+
+        if not new_acc:
+            await query.message.answer(
+                "❌ *Ни один системный аккаунт не может писать в этот чат.*\n\n"
+                "💡 Добавьте личный аккаунт через /accounts и попробуйте снова.",
+                reply_markup=kb_back_to_menu(),
+                parse_mode="Markdown",
+            )
+            return
+
+    else:
+        new_acc = await account_service.get_account_by_id(db, new_account_id)
+        if not new_acc or new_acc.owner_id != user.id:
+            await query.answer("Аккаунт не найден.", show_alert=True)
+            return
+        if new_acc.status != "ok":
+            await _back_to_account_list(
+                f"Аккаунт `{new_acc.phone}` недоступен: {new_acc.status_label}"
+            )
+            return
+
+        # Проверяем может ли этот личный аккаунт писать в чат
+        await query.answer()
+        checking_msg = await query.message.answer(
+            f"🔍 Проверяю аккаунт {new_acc.phone}..."
+        )
+        client = account_service.make_client(new_acc)
+        can_write = False
+        fail_reason = ""
+        try:
+            await client.connect()
+            can_write, fail_reason = await account_service.can_write_to_chat(client, chat_id_check)
+        except Exception as e:
+            fail_reason = str(e)
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+        try:
+            await checking_msg.delete()
+        except Exception:
+            pass
+
+        if not can_write:
+            reason_labels = {
+                "banned":          "аккаунт заблокирован администратором чата",
+                "write_forbidden": "нет прав на отправку сообщений",
+                "kicked":          "аккаунт исключён из чата",
+                "private":         "чат приватный",
+                "not_found":       "чат не найден",
+            }
+            reason_text = reason_labels.get(fail_reason, fail_reason)
+            await _back_to_account_list(
+                f"Аккаунт `{new_acc.phone}` не может писать в этот чат.\n"
+                f"Причина: {reason_text}"
+            )
+            return
+
+    # Собираем все chat_id задачи из всех TaskAccount
+    result = await db.execute(
+        select(TaskAccount).where(TaskAccount.task_id == task_id)
+    )
+    old_task_accounts = result.scalars().all()
+
+    all_chat_ids: list[str] = []
+    for ta in old_task_accounts:
+        try:
+            ids = json.loads(ta.chat_ids or "[]")
+            all_chat_ids.extend([str(x) for x in ids])
+        except Exception:
+            pass
+        # Уменьшаем счётчик старого аккаунта
+        result2 = await db.execute(
+            select(Account).where(Account.id == ta.account_id)
+        )
+        old_acc_obj = result2.scalar_one_or_none()
+        if old_acc_obj:
+            old_acc_obj.chats_count = max(0, old_acc_obj.chats_count - len(
+                json.loads(ta.chat_ids or "[]")
+            ))
+        await db.delete(ta)
+
+    # Убираем дубли, сохраняем порядок
+    all_chat_ids = list(dict.fromkeys(all_chat_ids))
+
+    if not all_chat_ids:
+        await query.message.answer(
+            "⚠️ В задаче не осталось чатов.",
+            reply_markup=kb_back_to_menu(),
+        )
+        return
+
+    # Создаём новый TaskAccount
+    db.add(TaskAccount(
+        task_id=task_id,
+        account_id=new_acc.id,
+        chat_ids=json.dumps(all_chat_ids),
+    ))
+    new_acc.chats_count += len(all_chat_ids)
+
+    # Включаем задачу
+    task.is_active = True
+    await db.commit()
+
+    acc_display = f"`{new_acc.phone}`"
+    if new_acc.is_system:
+        acc_display += " _(системный)_"
+
+    await query.answer()
+    await query.message.answer(
+        f"✅ *Рассылка перенесена и запущена*\n\n"
+        f"Задача: *{task.name}*\n"
+        f"Аккаунт: {acc_display}\n"
+        f"Чатов: *{len(all_chat_ids)}*\n\n"
+        f"Управление задачей: /tasks",
+        reply_markup=kb_back_to_menu(),
+        parse_mode="Markdown",
+    )
+    log.info(
+        "Пользователь %d перенёс задачу %d на аккаунт %s (%d чатов)",
+        user.id, task_id, new_acc.phone, len(all_chat_ids),
+    )
+
+
+# ── Вспомогательные функции ───────────────────────────────────────────────────
+
 def _entities_to_json(entities) -> list[dict[str, Any]]:
-    """
-    Aiogram entities -> JSON-совместимый список.
-    Храним только то, что нужно для восстановления форматирования.
-    """
     if not entities:
         return []
     out: list[dict[str, Any]] = []
     for e in entities:
-        d = {
-            "type": e.type,
-            "offset": e.offset,
-            "length": e.length,
-        }
-        # Для text_link (и иногда других) важен url
+        d = {"type": e.type, "offset": e.offset, "length": e.length}
         url = getattr(e, "url", None)
         if url:
             d["url"] = url
@@ -566,22 +872,12 @@ def _entities_to_json(entities) -> list[dict[str, Any]]:
 
 
 def _extract_text_and_entities(msg: Message) -> tuple[str, list[dict[str, Any]]]:
-    """
-    Достаём текст и entities из Message:
-    - если пользователь прислал текст -> msg.text + msg.entities
-    - если прислал фото/альбом с подписью -> msg.caption + msg.caption_entities
-    """
     if msg.caption is not None:
-        text = msg.caption
-        ents = _entities_to_json(msg.caption_entities)
-        return text, ents
+        return msg.caption, _entities_to_json(msg.caption_entities)
+    return msg.text or "", _entities_to_json(msg.entities)
 
-    text = msg.text or ""
-    ents = _entities_to_json(msg.entities)
-    return text, ents
 
 def _reason_label(reason: str) -> str:
-    """Человекочитаемое описание причины недоступности чата."""
     labels = {
         "private":            "приватный чат (нет ссылки)",
         "private_no_link":    "приватный чат (нет invite-ссылки)",
