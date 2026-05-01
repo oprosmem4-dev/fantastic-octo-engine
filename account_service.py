@@ -27,13 +27,14 @@ from models import Account
 log = logging.getLogger(__name__)
 
 
-async def get_accounts(db: AsyncSession, owner_id: int | None = None) -> list[Account]:
-    """
-    Получить аккаунты.
-    owner_id=None → все системные аккаунты.
-    owner_id=X    → аккаунты пользователя X.
-    """
+async def get_accounts(
+    db: AsyncSession,
+    owner_id: int | None = None,
+    only_working: bool = True,   # ← новый параметр
+) -> list[Account]:
     q = select(Account).where(Account.is_active == True, Account.is_banned == False)
+    if only_working:
+        q = q.where(Account.status == "ok")   # ← фикс
     if owner_id is not None:
         q = q.where(Account.owner_id == owner_id)
     else:
