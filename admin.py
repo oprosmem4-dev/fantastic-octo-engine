@@ -208,7 +208,7 @@ async def admin_accounts(query: CallbackQuery, user: User, db: AsyncSession):
     if not is_admin(user):
         return
 
-    accounts = await account_service.get_accounts(db)  # системные
+    accounts = await account_service.get_accounts(db, only_working=False) 
     lines = []
     for acc in accounts:
         status = "✅" if acc.is_active and not acc.is_banned else "❌"
@@ -346,3 +346,4 @@ async def _finish_system_account(message, state, user, db, client, phone, sessio
         reply_markup=kb_back_to_menu(),
         parse_mode="Markdown"
     )
+
