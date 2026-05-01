@@ -206,6 +206,10 @@ async def can_write_to_chat(client: TelegramClient, chat_id: str) -> tuple[bool,
         CheckChatInviteRequest,
     )
 
+    if not chat_id:
+        return False, "invalid_id"
+    chat_id = str(chat_id)
+
     is_invite_link = chat_id.startswith("https://t.me/+") or chat_id.startswith("t.me/+")
 
     # ── Шаг 1: получить entity ────────────────────────────────────────────────
