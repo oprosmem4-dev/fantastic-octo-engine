@@ -201,43 +201,68 @@ async def can_write_to_chat(client: TelegramClient, chat_id: str) -> tuple[bool,
     Это единственный 100% надёжный способ проверки.
     """
     from telethon.tl.functions.channels import JoinChannelRequest
-    from telethon.tl.functions.messages import ImportChatInviteRequest, DeleteMessagesRequest
-    from telethon.tl.functions.channels import DeleteMessagesRequest as ChannelDeleteMessagesRequest
+    from telethon.tl.functions.messages import (
+        ImportChatInviteRequest,
+        CheckChatInviteRequest,
+    )
+
+    if not chat_id:
+        return False, "invalid_id"
+    chat_id = str(chat_id)
+
+    is_invite_link = chat_id.startswith("https://t.me/+") or chat_id.startswith("t.me/+")
 
     # ── Шаг 1: получить entity ────────────────────────────────────────────────
+    # Инвайт-ссылки обрабатываются отдельно в Шаге 2, пропускаем здесь
     entity = None
-    try:
-        if not chat_id.lstrip("-").isdigit():
-            entity = await client.get_entity(f"@{chat_id}")
-        else:
-            try:
-                entity = await client.get_entity(int(chat_id))
-            except Exception:
+    if not is_invite_link:
+        try:
+            if chat_id.lstrip("-").isdigit():
                 try:
-                    n = int(chat_id)
-                    if n > 0:
-                        entity = await client.get_entity(int(f"-100{n}"))
+                    entity = await client.get_entity(int(chat_id))
                 except Exception:
-                    pass
-    except ChannelPrivateError:
-        return False, "private"
-    except (PeerIdInvalidError, ValueError):
-        return False, "invalid_id"
-    except Exception as e:
-        return False, str(e)
+                    try:
+                        n = int(chat_id)
+                        if n > 0:
+                            entity = await client.get_entity(int(f"-100{n}"))
+                    except Exception:
+                        pass
+            else:
+                # Убираем случайный @ если он уже есть в начале
+                username = chat_id.lstrip("@")
+                entity = await client.get_entity(f"@{username}")
+        except ChannelPrivateError:
+            return False, "private"
+        except (PeerIdInvalidError, ValueError):
+            return False, "invalid_id"
+        except Exception as e:
+            return False, str(e)
 
-    if entity is None:
-        return False, "not_found"
+        if entity is None:
+            return False, "not_found"
 
-    # ── Шаг 2: попробовать вступить если есть username ────────────────────────
-    if chat_id.startswith("https://t.me/+") or chat_id.startswith("t.me/+"):
+    # ── Шаг 2: вступить в чат если нужно ─────────────────────────────────────
+    if is_invite_link:
+        # Для инвайт-ссылок: сначала вступаем (или проверяем членство),
+        # затем получаем entity из результата
         invite_hash = chat_id.rstrip("/").split("+")[-1]
         try:
-            await client(ImportChatInviteRequest(invite_hash))
+            updates = await client(ImportChatInviteRequest(invite_hash))
             await asyncio.sleep(1)
-            entity = await client.get_entity(entity.id)
+            # Получаем entity из списка чатов в ответе
+            if hasattr(updates, "chats") and updates.chats:
+                entity = updates.chats[0]
+            else:
+                return False, "not_found"
         except UserAlreadyParticipantError:
-            pass
+            # Уже участник — получаем entity через CheckChatInviteRequest
+            try:
+                info = await client(CheckChatInviteRequest(hash=invite_hash))
+                entity = getattr(info, "chat", None)
+                if entity is None:
+                    return False, "not_found"
+            except Exception as e:
+                return False, str(e)
         except InviteHashExpiredError:
             return False, "invite_expired"
         except ChannelsTooMuchError:
@@ -248,6 +273,7 @@ async def can_write_to_chat(client: TelegramClient, chat_id: str) -> tuple[bool,
             return False, str(e)
 
     elif getattr(entity, "username", None):
+        # Для публичных каналов/групп — пробуем вступить если ещё не участник
         try:
             await client(JoinChannelRequest(entity))
             await asyncio.sleep(1)
