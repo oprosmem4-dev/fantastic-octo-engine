@@ -107,3 +107,4 @@ async def count_active_users(db: AsyncSession) -> int:
         select(Task.user_id).where(Task.is_active == True).distinct()
     )
     return len(result.scalars().all())
+
