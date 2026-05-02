@@ -64,9 +64,9 @@ async def cmd_status(message: Message, user: User):
 
 # ── Callback-и ────────────────────────────────────────────────────────────────
 
-@router.callback_query(F.data == "menu")
+@router.callback_query(F.data.in_({"menu", "menu:new"}))
 async def cb_menu(query: CallbackQuery, user: User):
-    """Вернуться в главное меню."""
+    """Вернуться в главное меню. Обрабатывает и 'menu' и 'menu:new'."""
     await query.message.edit_text(
         f"👋 Главное меню\n{user.subscription_status}",
         reply_markup=kb_main_menu(user.has_access),
