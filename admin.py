@@ -2,16 +2,19 @@
 bot/handlers/admin.py — панель администратора.
 
 Функции:
-  - Статистика сервиса
+  - Детальная статистика пользователей с подписками
   - Управление пользователями (блок/разблок, лимиты, подписка)
   - Управление системными аккаунтами
+  - Рассылка сообщений всем пользователям (/broadcast)
 """
 import logging
+from datetime import datetime, timezone
+
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -30,6 +33,13 @@ router = Router()
 
 def is_admin(user: User) -> bool:
     return user.is_admin or user.id == OWNER_ID
+
+
+# ── FSM для рассылки ──────────────────────────────────────────────────────────
+
+class BroadcastState(StatesGroup):
+    message = State()
+    confirm = State()
 
 
 # ── Вход в админ-панель ───────────────────────────────────────────────────────
@@ -57,34 +67,111 @@ async def admin_stats(query: CallbackQuery, user: User, db: AsyncSession):
     if not is_admin(user):
         return
 
-    # Считаем всё
+    now = datetime.now(timezone.utc)
+
     total_users = (await db.execute(select(func.count(User.id)))).scalar()
     active_users = await count_active_users(db)
     total_tasks  = (await db.execute(select(func.count(Task.id)).where(Task.is_active == True))).scalar()
     total_accs   = (await db.execute(select(func.count(Account.id)).where(Account.is_active == True))).scalar()
 
-    # Загрузка аккаунтов
+    # Пользователи с активной подпиской (не триал)
     result = await db.execute(
-        select(Account).where(Account.is_active == True, Account.is_banned == False)
+        select(User).where(User.sub_ends_at > now).order_by(User.sub_ends_at.asc())
     )
-    accounts = result.scalars().all()
-    acc_lines = "\n".join(
-        f"  • `{a.phone}`: {a.chats_count}/35 чатов (свободно: {max(0, 35 - a.chats_count)})"
-        for a in accounts
-    ) or "  (нет аккаунтов)"
+    paid_users = result.scalars().all()
 
-    from config import MAX_CHATS_PER_ACCOUNT
-    text = (
-        f"📊 *Статистика*\n\n"
-        f"👥 Всего пользователей: {total_users}\n"
-        f"👤 Активных (с задачами): {active_users}\n"
-        f"📋 Активных задач: {total_tasks}\n"
-        f"🤖 Активных аккаунтов: {total_accs}\n\n"
-        f"🤖 *Загрузка аккаунтов:*\n{acc_lines}"
+    # Пользователи с триалом
+    result = await db.execute(
+        select(User).where(
+            User.trial_ends_at > now,
+            (User.sub_ends_at == None) | (User.sub_ends_at <= now)
+        )
     )
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    trial_users = result.scalars().all()
+
+    # Последние платежи (топ-10)
+    result = await db.execute(
+        select(Payment).where(Payment.status == "paid")
+        .order_by(Payment.paid_at.desc())
+        .limit(10)
+    )
+    recent_payments = result.scalars().all()
+
+    # Формируем текст по подпискам
+    subs_lines = []
+    for u in paid_users[:20]:
+        days_left = (u.sub_ends_at - now).days
+        uname = f"@{u.username}" if u.username else f"`{u.id}`"
+        subs_lines.append(f"• {uname} — {days_left} дн.")
+
+    trial_lines = []
+    for u in trial_users[:10]:
+        hours_left = int((u.trial_ends_at - now).total_seconds() / 3600)
+        uname = f"@{u.username}" if u.username else f"`{u.id}`"
+        trial_lines.append(f"• {uname} — {hours_left} ч.")
+
+    # Последние платежи
+    plan_names = {"1month": "1 мес", "3month": "3 мес", "6month": "6 мес"}
+    pay_lines = []
+    for p in recent_payments:
+        date_str = p.paid_at.strftime("%d.%m %H:%M") if p.paid_at else "—"
+        plan_label = plan_names.get(p.plan, p.plan)
+        pay_lines.append(f"• `{p.user_id}` — {plan_label}, {int(p.amount)}⭐ ({date_str})")
+
+    subs_block  = "\n".join(subs_lines)  if subs_lines  else "  (нет)"
+    trial_block = "\n".join(trial_lines) if trial_lines else "  (нет)"
+    pay_block   = "\n".join(pay_lines)   if pay_lines   else "  (нет)"
+
+    text = (
+        f"📊 *Статистика сервиса*\n\n"
+        f"👥 Всего пользователей: *{total_users}*\n"
+        f"👤 С активными задачами: *{active_users}*\n"
+        f"📋 Активных задач: *{total_tasks}*\n"
+        f"🤖 Активных аккаунтов: *{total_accs}*\n\n"
+        f"✅ *Активные подписки ({len(paid_users)}):*\n{subs_block}\n\n"
+        f"🎁 *На триале ({len(trial_users)}):*\n{trial_block}\n\n"
+        f"💰 *Последние оплаты:*\n{pay_block}"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 Все пользователи", callback_data="admin:stats:users")],
+        [InlineKeyboardButton(text="🔄 Обновить",         callback_data="admin:stats")],
+        [InlineKeyboardButton(text="◀️ Назад",            callback_data="admin:menu")],
+    ])
+    await query.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+
+
+@router.callback_query(F.data == "admin:stats:users")
+async def admin_stats_users(query: CallbackQuery, user: User, db: AsyncSession):
+    """Список всех пользователей с кратким статусом подписки."""
+    if not is_admin(user):
+        return
+
+    now = datetime.now(timezone.utc)
+    result = await db.execute(
+        select(User).order_by(User.created_at.desc()).limit(50)
+    )
+    users = result.scalars().all()
+
+    lines = []
+    for u in users:
+        if u.sub_ends_at and u.sub_ends_at > now:
+            days = (u.sub_ends_at - now).days
+            status = f"✅ {days}д"
+        elif u.trial_ends_at and u.trial_ends_at > now:
+            hours = int((u.trial_ends_at - now).total_seconds() / 3600)
+            status = f"🎁 {hours}ч"
+        else:
+            status = "❌"
+
+        blocked = " 🚫" if u.is_blocked else ""
+        uname = f"@{u.username}" if u.username else u.full_name or str(u.id)
+        lines.append(f"`{u.id}` {uname} — {status}{blocked}")
+
+    text = f"👥 *Пользователи (последние 50):*\n\n" + "\n".join(lines)
+
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="◀️ Назад", callback_data="admin:menu")
+        InlineKeyboardButton(text="◀️ Назад", callback_data="admin:stats")
     ]])
     await query.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
 
@@ -103,9 +190,9 @@ async def admin_users(query: CallbackQuery, user: User, db: AsyncSession):
         "`/block <user_id>` — заблокировать\n"
         "`/unblock <user_id>` — разблокировать\n"
         "`/setlimit <user_id> <chats>` — лимит чатов\n"
-        "`/userinfo <user_id>` — инфо о пользователе"
+        "`/userinfo <user_id>` — инфо о пользователе\n"
+        "`/broadcast` — рассылка всем пользователям"
     )
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="◀️ Назад", callback_data="admin:menu")
     ]])
@@ -114,7 +201,6 @@ async def admin_users(query: CallbackQuery, user: User, db: AsyncSession):
 
 @router.message(Command("giveday"))
 async def cmd_giveday(message: Message, user: User, db: AsyncSession):
-    """Выдать подписку: /giveday 123456789 30"""
     if not is_admin(user):
         return
     args = message.text.split()
@@ -128,7 +214,6 @@ async def cmd_giveday(message: Message, user: User, db: AsyncSession):
         return
     await add_subscription(db, target, days)
     await message.answer(f"✅ Пользователю `{target_id}` выдано *{days} дней* подписки.", parse_mode="Markdown")
-    # Уведомляем пользователя
     try:
         await message.bot.send_message(target_id, f"🎉 Вам выдана подписка на *{days} дней*!", parse_mode="Markdown")
     except Exception:
@@ -137,7 +222,6 @@ async def cmd_giveday(message: Message, user: User, db: AsyncSession):
 
 @router.message(Command("block"))
 async def cmd_block(message: Message, user: User, db: AsyncSession):
-    """Заблокировать пользователя."""
     if not is_admin(user):
         return
     args = message.text.split()
@@ -150,7 +234,6 @@ async def cmd_block(message: Message, user: User, db: AsyncSession):
 
 @router.message(Command("unblock"))
 async def cmd_unblock(message: Message, user: User, db: AsyncSession):
-    """Разблокировать пользователя."""
     if not is_admin(user):
         return
     args = message.text.split()
@@ -163,7 +246,6 @@ async def cmd_unblock(message: Message, user: User, db: AsyncSession):
 
 @router.message(Command("setlimit"))
 async def cmd_setlimit(message: Message, user: User, db: AsyncSession):
-    """Установить лимит чатов."""
     if not is_admin(user):
         return
     args = message.text.split()
@@ -176,7 +258,6 @@ async def cmd_setlimit(message: Message, user: User, db: AsyncSession):
 
 @router.message(Command("userinfo"))
 async def cmd_userinfo(message: Message, user: User, db: AsyncSession):
-    """Информация о пользователе."""
     if not is_admin(user):
         return
     args = message.text.split()
@@ -208,13 +289,16 @@ async def admin_accounts(query: CallbackQuery, user: User, db: AsyncSession):
     if not is_admin(user):
         return
 
-    accounts = await account_service.get_accounts(db, only_working=False) 
+    result = await db.execute(
+        select(Account).where(Account.is_system == True).order_by(Account.id)
+    )
+    accounts = result.scalars().all()
+
     lines = []
     for acc in accounts:
-        status = "✅" if acc.is_active and not acc.is_banned else "❌"
-        lines.append(f"{status} `{acc.phone}` — {acc.chats_count}/35 чатов")
+        icon = acc.status_icon
+        lines.append(f"{icon} `{acc.phone}` — {acc.chats_count} чатов")
 
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить системный", callback_data="admin:addacc")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:menu")],
@@ -222,7 +306,9 @@ async def admin_accounts(query: CallbackQuery, user: User, db: AsyncSession):
 
     text = "🤖 *Системные аккаунты*\n\n" + ("\n".join(lines) or "(нет аккаунтов)")
     await query.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
-# ── Добавление системного аккаунта (только админ) ─────────────────────────────
+
+
+# ── Добавление системного аккаунта ────────────────────────────────────────────
 
 class AddSystemAccount(StatesGroup):
     api_id   = State()
@@ -230,6 +316,7 @@ class AddSystemAccount(StatesGroup):
     phone    = State()
     code     = State()
     password = State()
+
 
 @router.callback_query(F.data == "admin:addacc")
 async def admin_start_add_acc(query: CallbackQuery, state: FSMContext, user: User):
@@ -244,6 +331,7 @@ async def admin_start_add_acc(query: CallbackQuery, state: FSMContext, user: Use
     )
     await state.set_state(AddSystemAccount.api_id)
 
+
 @router.message(AddSystemAccount.api_id)
 async def admin_got_apiid(message: Message, state: FSMContext, user: User):
     if not is_admin(user):
@@ -255,13 +343,18 @@ async def admin_got_apiid(message: Message, state: FSMContext, user: User):
     await message.answer("*Шаг 2/3* — Введите API\\_HASH:", reply_markup=kb_cancel(), parse_mode="Markdown")
     await state.set_state(AddSystemAccount.api_hash)
 
+
 @router.message(AddSystemAccount.api_hash)
 async def admin_got_apihash(message: Message, state: FSMContext, user: User):
     if not is_admin(user):
         return
     await state.update_data(api_hash=message.text.strip())
-    await message.answer("*Шаг 3/3* — Введите номер телефона:\nПример: `+998901234567`", reply_markup=kb_cancel(), parse_mode="Markdown")
+    await message.answer(
+        "*Шаг 3/3* — Введите номер телефона:\nПример: `+998901234567`",
+        reply_markup=kb_cancel(), parse_mode="Markdown"
+    )
     await state.set_state(AddSystemAccount.phone)
+
 
 @router.message(AddSystemAccount.phone)
 async def admin_got_phone(message: Message, state: FSMContext, user: User):
@@ -280,6 +373,7 @@ async def admin_got_phone(message: Message, state: FSMContext, user: User):
     except Exception as e:
         await message.answer(f"❌ Ошибка: `{e}`", parse_mode="Markdown")
         await state.clear()
+
 
 @router.message(AddSystemAccount.code)
 async def admin_got_code(message: Message, state: FSMContext, user: User, db: AsyncSession):
@@ -307,6 +401,7 @@ async def admin_got_code(message: Message, state: FSMContext, user: User, db: As
         return
     await _finish_system_account(message, state, user, db, client, data["phone"], session_str)
 
+
 @router.message(AddSystemAccount.password)
 async def admin_got_password(message: Message, state: FSMContext, user: User, db: AsyncSession):
     if not is_admin(user):
@@ -323,6 +418,7 @@ async def admin_got_password(message: Message, state: FSMContext, user: User, db
         return
     await _finish_system_account(message, state, user, db, client, data["phone"], session_str)
 
+
 async def _finish_system_account(message, state, user, db, client, phone, session_str):
     data = await state.get_data()
     name = await account_service.get_me_name(client)
@@ -330,15 +426,14 @@ async def _finish_system_account(message, state, user, db, client, phone, sessio
     message.bot._pending_clients.pop(message.from_user.id, None)
     await state.clear()
 
-    # is_system=True — главное отличие от личного аккаунта
     acc = await account_service.create_account(
         db,
         api_id=data["api_id"],
         api_hash=data["api_hash"],
         phone=phone,
         session_string=session_str,
-        owner_id=None,      # нет владельца — системный
-        is_system=True,     # доступен всем пользователям
+        owner_id=None,
+        is_system=True,
     )
     await message.answer(
         f"✅ Системный аккаунт *{name}* (`{phone}`) добавлен!\n"
@@ -347,3 +442,104 @@ async def _finish_system_account(message, state, user, db, client, phone, sessio
         parse_mode="Markdown"
     )
 
+
+# ── Рассылка всем пользователям ───────────────────────────────────────────────
+
+@router.callback_query(F.data == "admin:broadcast")
+async def cb_broadcast(query: CallbackQuery, state: FSMContext, user: User):
+    if not is_admin(user):
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+
+    await query.message.edit_text(
+        "📢 *Рассылка всем пользователям*\n\n"
+        "Напишите сообщение которое получат ВСЕ пользователи бота.\n\n"
+        "⚠️ Поддерживаются: текст, фото с подписью, Markdown-форматирование.",
+        reply_markup=kb_cancel(),
+        parse_mode="Markdown"
+    )
+    await state.set_state(BroadcastState.message)
+
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message, state: FSMContext, user: User):
+    if not is_admin(user):
+        return
+    await message.answer(
+        "📢 *Рассылка всем пользователям*\n\n"
+        "Напишите сообщение которое получат ВСЕ пользователи бота.\n\n"
+        "⚠️ Поддерживаются: текст, фото с подписью.",
+        reply_markup=kb_cancel(),
+        parse_mode="Markdown"
+    )
+    await state.set_state(BroadcastState.message)
+
+
+@router.message(BroadcastState.message)
+async def got_broadcast_message(message: Message, state: FSMContext):
+    """Получили сообщение для рассылки — просим подтвердить."""
+    # Сохраняем message_id чтобы потом его переслать
+    await state.update_data(
+        broadcast_from_chat=message.chat.id,
+        broadcast_message_id=message.message_id,
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Разослать всем", callback_data="admin:broadcast:confirm")],
+        [InlineKeyboardButton(text="❌ Отмена",         callback_data="menu:new")],
+    ])
+
+    await message.answer(
+        "👆 *Сообщение выше будет разослано всем пользователям.*\n\n"
+        "Подтвердите отправку:",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+    await state.set_state(BroadcastState.confirm)
+
+
+@router.callback_query(BroadcastState.confirm, F.data == "admin:broadcast:confirm")
+async def confirm_broadcast(query: CallbackQuery, state: FSMContext, user: User, db: AsyncSession):
+    if not is_admin(user):
+        return
+
+    data = await state.get_data()
+    from_chat = data.get("broadcast_from_chat")
+    msg_id    = data.get("broadcast_message_id")
+    await state.clear()
+
+    # Получаем всех незаблокированных пользователей
+    result = await db.execute(
+        select(User).where(User.is_blocked == False)
+    )
+    all_users = result.scalars().all()
+
+    await query.message.edit_text(
+        f"📢 Начинаю рассылку *{len(all_users)}* пользователям...",
+        parse_mode="Markdown"
+    )
+
+    sent = 0
+    failed = 0
+    for u in all_users:
+        if u.id == user.id:
+            continue  # не слать самому себе
+        try:
+            await query.bot.forward_message(
+                chat_id=u.id,
+                from_chat_id=from_chat,
+                message_id=msg_id,
+            )
+            sent += 1
+        except Exception:
+            failed += 1
+
+    await query.message.edit_text(
+        f"✅ *Рассылка завершена*\n\n"
+        f"✉️ Отправлено: *{sent}*\n"
+        f"❌ Ошибок: *{failed}*\n\n"
+        f"(Ошибки обычно = пользователь заблокировал бота)",
+        reply_markup=kb_back_to_menu(),
+        parse_mode="Markdown"
+    )
+    log.info("Broadcast от %d: sent=%d failed=%d", user.id, sent, failed)
