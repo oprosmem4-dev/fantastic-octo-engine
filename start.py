@@ -11,6 +11,20 @@ from bot.keyboards import kb_main_menu, kb_back_to_menu
 
 router = Router()
 
+# Сообщение, которое отправляется и закрепляется при первом запуске пользователем.
+# Изменяй эту переменную по своему усмотрению.
+start_zakrep = (
+    "📌 *Важная информация*\n\n"
+    """Добро пожаловать! Ознакомьтесь с манулом для пользования ботом. 
+    Если есть вопросы, можете задавать 24/7 
+    Админ - @jstaskmebro
+    Мануал - https://t.me/rasilkatextinfo """
+)
+
+# Кусок текста из start_zakrep, по которому определяем "наше" ли закреплённое сообщение.
+# Берём первые 40 символов без форматирования — этого достаточно для уникальной идентификации.
+_ZAKREP_FINGERPRINT = "Важная информация"
+
 
 def status_text(user: User) -> str:
     """Текст статуса пользователя."""
@@ -39,6 +53,33 @@ async def cmd_start(message: Message, user: User):
         "Выбери действие:"
     )
     await message.answer(text, reply_markup=kb_main_menu(user.has_access), parse_mode="Markdown")
+
+    # Только при первом запуске проверяем и при необходимости закрепляем сообщение
+    if len(user.tasks) == 0:
+        try:
+            chat = await message.bot.get_chat(message.chat.id)
+            pinned = chat.pinned_message
+
+            # Проверяем текст закреплённого сообщения — наше ли оно
+            already_pinned = (
+                pinned is not None
+                and pinned.text is not None
+                and _ZAKREP_FINGERPRINT in pinned.text
+            )
+
+            if not already_pinned:
+                sent = await message.answer(start_zakrep, parse_mode="Markdown")
+                await message.bot.pin_chat_message(
+                    chat_id=message.chat.id,
+                    message_id=sent.message_id,
+                    disable_notification=True,
+                )
+        except Exception:
+            # Нет прав закреплять — просто отправляем без закрепления
+            try:
+                await message.answer(start_zakrep, parse_mode="Markdown")
+            except Exception:
+                pass
 
 
 @router.message(Command("help"))
