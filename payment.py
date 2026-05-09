@@ -57,7 +57,7 @@ async def select_plan(query: CallbackQuery):
         return
 
     info = SUBSCRIPTION_PRICES[plan]
-    plan_names = {"1month": "1 месяц", "3month": "3 месяца", "6month": "6 месяцев"}
+    plan_names = {"1month": "1 месяц", "1week": "1 неделя", "6month": "6 месяцев"}
     text = (
         f"🛒 *{plan_names[plan]}*\n\n"
         f"⭐ Telegram Stars: {info['stars']}\n\n"
@@ -84,7 +84,7 @@ async def pay_stars(query: CallbackQuery, user: User, db: AsyncSession):
 
     plan = query.data.split(":")[2]
     price = payment_service.get_stars_price(plan)
-    plan_names = {"1month": "1 месяц", "3month": "3 месяца", "6month": "6 месяцев"}
+    plan_names = {"1month": "1 месяц", "1week": "1 неделя", "6month": "6 месяцев"}
 
     payment = await payment_service.create_payment(db, user.id, "stars", plan)
 
@@ -118,7 +118,7 @@ async def successful_payment(message: Message, user: User, db: AsyncSession):
     if payment and payment.status == "pending":
         await payment_service.confirm_payment(db, payment, user)
 
-        plan_names = {"1month": "1 месяц", "3month": "3 месяца", "6month": "6 месяцев"}
+        plan_names = {"1month": "1 месяц", "1week": "1 неделя", "6month": "6 месяцев"}
         plan_label = plan_names.get(payment.plan, payment.plan)
         stars_amount = payment.amount
 
@@ -157,7 +157,7 @@ async def pay_admin(query: CallbackQuery, user: User):
         return
 
     plan = query.data.split(":")[2]
-    plan_names = {"1month": "1 месяц", "3month": "3 месяца", "6month": "6 месяцев"}
+    plan_names = {"1month": "1 месяц", "1week": "1 неделя", "6month": "6 месяцев"}
     plan_label = plan_names.get(plan, plan)
     info = SUBSCRIPTION_PRICES[plan]
 
