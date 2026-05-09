@@ -31,7 +31,7 @@ def kb_subscription_plans(is_mirror: bool = False) -> InlineKeyboardMarkup:
             )
         ]])
     builder = InlineKeyboardBuilder()
-    labels = {"1month": "1 месяц", "3month": "3 месяца", "6month": "6 месяцев"}
+    labels = {"1month": "1 месяц", "1week" : "1 неделя", "6month": "6 месяцев"}
     for plan, info in SUBSCRIPTION_PRICES.items():
         label = f"{labels[plan]} — {info['stars']}⭐"
         builder.button(text=label, callback_data=f"pay:select:{plan}")
