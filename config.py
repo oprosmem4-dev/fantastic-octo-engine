@@ -25,14 +25,14 @@ TON_WALLET = os.getenv("TON_WALLET", "")
 
 # ── Тарифы подписки ───────────────────────────────────────────────────────────
 SUBSCRIPTION_PRICES = {
-    "1month": {"stars": 100, "usdt": 5.0,  "days": 30},
-    "3month": {"stars": 250, "usdt": 12.0, "days": 90},
+    "1week": {"stars": 50, "usdt": 1.0,  "days": 7},
+    "1month": {"stars": 150, "usdt": 3.0, "days": 30},
     "6month": {"stars": 450, "usdt": 20.0, "days": 180},
 }
 
 # ── Лимиты ────────────────────────────────────────────────────────────────────
 MAX_CHATS_PER_USER = 100
-TRIAL_DAYS         = 1
+TRIAL_DAYS         = 3
 
 # ── Ссылка на главного бота (для зеркал) ──────────────────────────────────────
 MAIN_BOT_LINK = os.getenv("MAIN_BOT_LINK", "https://t.me/your_main_bot")
