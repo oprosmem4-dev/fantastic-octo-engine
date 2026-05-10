@@ -1,10 +1,10 @@
 """
 services/task_service.py — управление задачами рассылок.
 
-ИЗМЕНЕНИЯ:
-  - _distribute_chats: при системных аккаунтах чаты делятся равномерно
-    по всем доступным системным аккаунтам (round-robin).
-  - chat_title сохраняется как "title (username)" для отображения.
+ИСПРАВЛЕНИЯ:
+  - _normalize_chat_id: убирает двойной @@ из chat_id перед сохранением
+  - stored_title: больше не добавляет @ если он уже есть в title
+  - chat_id нормализуется перед сохранением в TaskChat и TaskAccount
 """
 import json
 import logging
@@ -17,6 +17,36 @@ from config import MAX_CHATS_PER_USER
 from models import Task, TaskChat, TaskAccount, Account, User, Log
 
 log = logging.getLogger(__name__)
+
+
+def _normalize_chat_id(chat_id: str) -> str:
+    """
+    Нормализовать chat_id:
+      @@username   → @username
+      @username    → @username  (без изменений)
+      -1001234567  → -1001234567 (без изменений)
+    """
+    s = str(chat_id).strip()
+    if s.startswith("@"):
+        # убираем все лишние @ в начале, оставляем ровно один
+        username = s.lstrip("@")
+        return f"@{username}"
+    return s
+
+
+def _make_stored_title(username: str | None, title: str | None, chat_id: str) -> str:
+    """
+    Сформировать chat_title для хранения в БД.
+    Правила:
+      - есть username → "@username" (ровно один @)
+      - нет username  → title как есть, или str(chat_id) если title пустой
+    """
+    if username:
+        clean = username.lstrip("@")
+        return f"@{clean}"
+    if title and title.strip():
+        return title.strip()
+    return str(chat_id)
 
 
 async def get_tasks(db: AsyncSession, user_id: int) -> list[Task]:
@@ -80,14 +110,15 @@ async def create_task(
     await db.flush()
 
     for chat in chats:
-        # Сохраняем username в chat_title для отображения в боте
+        raw_id   = str(chat["id"])
+        norm_id  = _normalize_chat_id(raw_id)           # убираем @@
         username = chat.get("username")
-        title    = chat.get("title") or chat.get("id")
-        stored_title = f"@{username}" if username else title
+        title    = chat.get("title") or ""
+        stored_title = _make_stored_title(username, title, norm_id)
 
         db.add(TaskChat(
             task_id=task.id,
-            chat_id=str(chat["id"]),
+            chat_id=norm_id,          # храним нормализованный ID
             chat_title=stored_title,
         ))
 
@@ -130,18 +161,12 @@ async def _distribute_chats(
 ):
     """
     Распределить чаты по аккаунтам.
-
-    preferred_account_id задан → все чаты на этот аккаунт (личный выбор).
-
-    preferred_account_id is None (системные аккаунты):
-      Чаты делятся РАВНОМЕРНО по всем доступным системным аккаунтам (round-robin).
-      При одном системном аккаунте — все чаты на него.
-      Лимита чатов на аккаунт нет.
+    chat_id нормализуется перед записью в TaskAccount.chat_ids.
     """
-    chat_ids = [str(c["id"]) for c in chats]
+    # Нормализуем все chat_id перед сохранением
+    chat_ids = [_normalize_chat_id(str(c["id"])) for c in chats]
 
     if preferred_account_id is not None:
-        # Личный аккаунт — все чаты на него
         result = await db.execute(
             select(Account).where(
                 Account.id == preferred_account_id,
@@ -212,7 +237,6 @@ async def _distribute_chats(
     distribution: dict[int, list[str]] = {acc.id: [] for acc in system_accounts}
 
     for cid in chat_ids:
-        # Сортируем по суммарной нагрузке: текущая + уже назначенные в этой задаче
         system_accounts.sort(
             key=lambda a: a.chats_count + len(distribution[a.id])
         )
