@@ -1,16 +1,17 @@
 """
 bot/generator_bot.py — бот-регистратор зеркал.
 
-Сюда приходит пользователь впервые.
-Отдаёт токен своего бота → мы валидируем, сохраняем MirrorBot,
-mirror_runner подхватывает и запускает зеркало автоматически.
-
-Этот бот сам по себе НЕ является рассылочным ботом.
-Только регистрация + статус зеркала + инструкция.
+Флоу:
+  1. Пользователь приходит → видит случайное рабочее зеркало + кнопку создать своё
+  2. Если хочет своё — отдаёт токен от BotFather
+  3. Мы валидируем токен, сохраняем MirrorBot, mirror_runner подхватывает автоматически
+  4. Оплата — кнопка "написать админу"
 """
 import asyncio
 import logging
+import random
 
+import aiohttp
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
@@ -22,7 +23,7 @@ from aiogram.types import (
 )
 from sqlalchemy import select
 
-from config import GENERATOR_BOT_TOKEN, OWNER_ID, MAIN_BOT_LINK
+from config import GENERATOR_BOT_TOKEN, OWNER_ID
 from database import SessionLocal, create_all_tables
 from models import MirrorBot, User
 from services.user_service import get_or_create_user
@@ -30,11 +31,81 @@ from services.user_service import get_or_create_user
 log = logging.getLogger(__name__)
 router = Router()
 
+ADMIN_USERNAME = "jstaskmebro"  # без @
 
-# ── FSM ───────────────────────────────────────────────────────────────────────
 
-class RegisterMirror(StatesGroup):
-    token = State()
+# ── Утилиты ───────────────────────────────────────────────────────────────────
+
+async def get_random_working_mirror(exclude_user_id: int | None = None) -> MirrorBot | None:
+    """
+    Возвращает случайное активное зеркало.
+    Проверяет доступность через Telegram Bot API getMe.
+    Исключает зеркало самого пользователя (если есть).
+    """
+    async with SessionLocal() as db:
+        q = select(MirrorBot).where(MirrorBot.is_active == True)
+        if exclude_user_id is not None:
+            q = q.where(MirrorBot.user_id != exclude_user_id)
+        result = await db.execute(q)
+        all_mirrors = list(result.scalars().all())
+
+    if not all_mirrors:
+        return None
+
+    # Перемешиваем и ищем первое рабочее
+    random.shuffle(all_mirrors)
+
+    async with aiohttp.ClientSession() as session:
+        for m in all_mirrors:
+            try:
+                resp = await session.get(
+                    f"https://api.telegram.org/bot{m.token}/getMe",
+                    timeout=aiohttp.ClientTimeout(total=5),
+                )
+                data = await resp.json()
+                if data.get("ok"):
+                    return m
+            except Exception:
+                continue
+
+    return None
+
+
+async def get_user_mirror(user_id: int) -> MirrorBot | None:
+    async with SessionLocal() as db:
+        result = await db.execute(
+            select(MirrorBot).where(MirrorBot.user_id == user_id)
+        )
+        return result.scalar_one_or_none()
+
+
+def kb_main(has_mirror: bool, mirror_username: str | None = None) -> InlineKeyboardMarkup:
+    buttons = []
+
+    if has_mirror and mirror_username:
+        buttons.append([InlineKeyboardButton(
+            text=f"🤖 Мой бот (@{mirror_username})",
+            url=f"https://t.me/{mirror_username}",
+        )])
+        buttons.append([InlineKeyboardButton(
+            text="📊 Статус моего бота", callback_data="mirror:status"
+        )])
+        buttons.append([InlineKeyboardButton(
+            text="🗑 Удалить и подключить другой", callback_data="mirror:delete_confirm"
+        )])
+    else:
+        buttons.append([InlineKeyboardButton(
+            text="➕ Подключить своего бота", callback_data="mirror:register"
+        )])
+
+    buttons.append([InlineKeyboardButton(
+        text="💳 Оплатить подписку", callback_data="pay:info"
+    )])
+    buttons.append([InlineKeyboardButton(
+        text="❓ Как это работает?", callback_data="howto"
+    )])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -49,83 +120,133 @@ async def cmd_start(message: Message):
             full_name=message.from_user.full_name,
         )
 
-        result = await db.execute(
-            select(MirrorBot).where(MirrorBot.user_id == user.id)
-        )
-        mirror = result.scalar_one_or_none()
+    user_mirror = await get_user_mirror(message.from_user.id)
 
-    if mirror:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🤖 Мой бот", callback_data="mirror:status")],
-            [InlineKeyboardButton(text="🗑 Удалить и заменить", callback_data="mirror:delete")],
-        ])
+    # Ищем случайное рабочее зеркало для демонстрации
+    demo_mirror = await get_random_working_mirror(exclude_user_id=message.from_user.id)
+
+    if user_mirror:
+        # У пользователя уже есть свой бот
         text = (
             f"👋 *Добро пожаловать!*\n\n"
-            f"У вас уже подключён бот:\n"
-            f"*@{mirror.bot_username or '?'}*\n"
-            f"Статус: {'✅ Активен' if mirror.is_active else '⏸ Остановлен'}\n\n"
-            f"Перейдите в него чтобы пользоваться сервисом."
+            f"У вас подключён бот: @{user_mirror.bot_username}\n\n"
+            f"Перейдите в него для управления рассылками."
+        )
+        if demo_mirror and demo_mirror.bot_username:
+            text += (
+                f"\n\n💡 *Попробовать сервис* можно в боте "
+                f"[@{demo_mirror.bot_username}](https://t.me/{demo_mirror.bot_username})"
+            )
+        await message.answer(
+            text,
+            reply_markup=kb_main(True, user_mirror.bot_username),
+            parse_mode="Markdown",
         )
     else:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Подключить своего бота", callback_data="mirror:register")],
-            [InlineKeyboardButton(text="❓ Как это работает?", callback_data="mirror:howto")],
-        ])
+        # Новый пользователь — показываем рабочее зеркало + предлагаем своё
+        if demo_mirror and demo_mirror.bot_username:
+            demo_text = (
+                f"🚀 *Попробуйте прямо сейчас:*\n"
+                f"[@{demo_mirror.bot_username}](https://t.me/{demo_mirror.bot_username})\n\n"
+                f"Или подключите *своего бота* — он будет работать только для вас."
+            )
+            extra_btn = [[InlineKeyboardButton(
+                text=f"🚀 Попробовать (@{demo_mirror.bot_username})",
+                url=f"https://t.me/{demo_mirror.bot_username}",
+            )]]
+        else:
+            demo_text = "Подключите *своего бота* — он будет работать только для вас."
+            extra_btn = []
+
         text = (
-            "👋 *Добро пожаловать в сервис рассылок!*\n\n"
-            "Здесь вы можете подключить *своего Telegram-бота* "
-            "и использовать его для автоматических рассылок.\n\n"
-            "🔹 Ваш бот работает на нашем сервере\n"
-            "🔹 Вы управляете им лично\n"
-            "🔹 Никто кроме вас не имеет доступа\n\n"
-            "Нажмите *Подключить своего бота* чтобы начать."
+            f"👋 *Добро пожаловать в сервис рассылок!*\n\n"
+            f"Автоматические рассылки в Telegram-чаты через ваши аккаунты.\n\n"
+            f"{demo_text}"
         )
 
-    await message.answer(text, reply_markup=kb, parse_mode="Markdown")
+        buttons = extra_btn + [
+            [InlineKeyboardButton(text="➕ Подключить своего бота", callback_data="mirror:register")],
+            [InlineKeyboardButton(text="💳 Оплатить подписку", callback_data="pay:info")],
+            [InlineKeyboardButton(text="❓ Как это работает?", callback_data="howto")],
+        ]
+        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+        await message.answer(text, reply_markup=kb, parse_mode="Markdown")
 
 
 # ── Инструкция ────────────────────────────────────────────────────────────────
 
-@router.callback_query(F.data == "mirror:howto")
+@router.callback_query(F.data == "howto")
 async def howto(query: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Подключить своего бота", callback_data="mirror:register")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back:start")],
     ])
     await query.message.edit_text(
         "❓ *Как это работает?*\n\n"
-        "1️⃣ Создайте нового бота у @BotFather\n"
-        "   Команда: `/newbot`\n\n"
+        "1️⃣ Создайте бота у @BotFather → /newbot\n\n"
         "2️⃣ Скопируйте токен бота\n"
-        "   Формат: `1234567890:AABBccdd...`\n\n"
+        "   Вид: `1234567890:AABBccdd...`\n\n"
         "3️⃣ Вставьте токен здесь\n\n"
-        "4️⃣ Мы подключим бота к нашему сервису\n\n"
-        "5️⃣ Перейдите в своего бота и начните работу!\n\n"
-        "⚠️ *Важно:* Не передавайте токен третьим лицам.",
+        "4️⃣ Через минуту ваш бот готов к работе!\n\n"
+        "5️⃣ Перейдите в него и нажмите /start\n\n"
+        "⚠️ Токен — это пароль от бота. Никому не передавайте.",
         reply_markup=kb,
         parse_mode="Markdown",
     )
 
 
-# ── Регистрация ───────────────────────────────────────────────────────────────
+# ── Оплата ────────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "pay:info")
+async def pay_info(query: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="✉️ Написать администратору",
+            url=f"https://t.me/{ADMIN_USERNAME}",
+        )],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back:start")],
+    ])
+    await query.message.edit_text(
+        "💳 *Оплата подписки*\n\n"
+        "Напишите администратору и укажите:\n"
+        f"• Ваш Telegram ID: `{query.from_user.id}`\n"
+        "• Желаемый тариф\n\n"
+        "💰 *Тарифы:*\n"
+        "• 1 неделя — 50 ⭐ Stars / $1\n"
+        "• 1 месяц — 150 ⭐ Stars / $3\n"
+        "• 6 месяцев — 450 ⭐ Stars / $20\n\n"
+        "✅ Принимаем: Telegram Stars, USDT\n\n"
+        f"👤 Администратор: @{ADMIN_USERNAME}",
+        reply_markup=kb,
+        parse_mode="Markdown",
+    )
+
+
+# ── FSM регистрации ───────────────────────────────────────────────────────────
+
+class RegisterMirror(StatesGroup):
+    token = State()
+
 
 @router.callback_query(F.data == "mirror:register")
 async def start_register(query: CallbackQuery, state: FSMContext):
-    async with SessionLocal() as db:
-        result = await db.execute(
-            select(MirrorBot).where(MirrorBot.user_id == query.from_user.id)
-        )
-        if result.scalar_one_or_none():
-            await query.answer("У вас уже есть подключённый бот.", show_alert=True)
-            return
+    existing = await get_user_mirror(query.from_user.id)
+    if existing:
+        await query.answer("У вас уже есть подключённый бот.", show_alert=True)
+        return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="start")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="back:start")],
     ])
     await query.message.edit_text(
-        "➕ *Подключение бота*\n\n"
-        "Отправьте токен вашего бота.\n"
-        "Получить можно у @BotFather → /mybots → выбрать бота → API Token\n\n"
-        "Формат: `1234567890:AABBccdd...`",
+        "➕ *Подключение своего бота*\n\n"
+        "Отправьте токен вашего бота.\n\n"
+        "Как получить токен:\n"
+        "1. Откройте @BotFather\n"
+        "2. Команда /mybots → выберите бота → API Token\n"
+        "   Или создайте нового: /newbot\n\n"
+        "Формат токена: `1234567890:AABBccdd...`",
         reply_markup=kb,
         parse_mode="Markdown",
     )
@@ -134,22 +255,22 @@ async def start_register(query: CallbackQuery, state: FSMContext):
 
 @router.message(RegisterMirror.token)
 async def got_token(message: Message, state: FSMContext):
-    token = message.text.strip()
+    token = message.text.strip() if message.text else ""
 
-    # Базовая проверка формата
     if ":" not in token or len(token) < 30:
         await message.answer(
             "❌ Неверный формат токена.\n"
-            "Должно быть что-то вроде: `1234567890:AABBccdd...`\n\n"
+            "Должно быть: `1234567890:AABBccdd...`\n\n"
             "Попробуйте ещё раз:",
             parse_mode="Markdown",
         )
         return
 
-    # Проверяем токен через Bot API
     await message.answer("🔍 Проверяю токен...")
+
+    # Проверка через Bot API
+    bot_username = None
     try:
-        import aiohttp
         async with aiohttp.ClientSession() as session:
             resp = await session.get(
                 f"https://api.telegram.org/bot{token}/getMe",
@@ -160,38 +281,32 @@ async def got_token(message: Message, state: FSMContext):
         if not data.get("ok"):
             await message.answer(
                 "❌ Токен не прошёл проверку.\n"
-                "Убедитесь что бот существует и токен скопирован правильно.\n\n"
-                "Попробуйте ещё раз:",
+                "Убедитесь что токен скопирован полностью и бот существует.\n\n"
+                "Попробуйте ещё раз:"
             )
             return
 
-        bot_info = data["result"]
-        bot_username = bot_info.get("username", "unknown")
+        bot_username = data["result"].get("username", "unknown")
 
     except Exception as e:
         log.error("Ошибка проверки токена: %s", e)
         await message.answer(
-            "❌ Не удалось проверить токен (сетевая ошибка).\n"
-            "Попробуйте позже."
+            "❌ Сетевая ошибка при проверке токена. Попробуйте позже."
         )
         await state.clear()
         return
 
-    # Проверяем что этот токен не занят другим пользователем
+    # Проверяем что токен не занят
     async with SessionLocal() as db:
-        result = await db.execute(
-            select(MirrorBot).where(MirrorBot.token == token)
-        )
-        existing = result.scalar_one_or_none()
-        if existing:
+        result = await db.execute(select(MirrorBot).where(MirrorBot.token == token))
+        if result.scalar_one_or_none():
             await message.answer(
-                "❌ Этот токен уже используется другим пользователем.\n"
+                "❌ Этот токен уже зарегистрирован.\n"
                 "Создайте нового бота у @BotFather."
             )
             await state.clear()
             return
 
-        # Также проверяем что у пользователя ещё нет зеркала
         result = await db.execute(
             select(MirrorBot).where(MirrorBot.user_id == message.from_user.id)
         )
@@ -200,7 +315,6 @@ async def got_token(message: Message, state: FSMContext):
             await state.clear()
             return
 
-        # Создаём запись
         mirror = MirrorBot(
             user_id=message.from_user.id,
             token=token,
@@ -215,72 +329,99 @@ async def got_token(message: Message, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text=f"🚀 Перейти к @{bot_username}",
-            url=f"https://t.me/{bot_username}"
+            url=f"https://t.me/{bot_username}",
         )],
-        [InlineKeyboardButton(text="📊 Статус подключения", callback_data="mirror:status")],
+        [InlineKeyboardButton(text="📊 Статус", callback_data="mirror:status")],
     ])
 
     await message.answer(
         f"✅ *Бот @{bot_username} подключён!*\n\n"
-        f"⏳ Запуск занимает до 60 секунд.\n\n"
-        f"После этого перейдите в своего бота и отправьте `/start`.\n\n"
-        f"Там доступно всё: создание задач, добавление аккаунтов, управление рассылками.",
+        f"⏳ Запуск занимает до 60 секунд.\n"
+        f"После этого нажмите /start в своём боте.",
         reply_markup=kb,
         parse_mode="Markdown",
     )
 
     # Уведомляем владельца сервиса
     try:
-        gen_bot = Bot(token=GENERATOR_BOT_TOKEN)
-        await gen_bot.send_message(
-            OWNER_ID,
-            f"🆕 *Новое зеркало зарегистрировано*\n\n"
-            f"Пользователь: `{message.from_user.id}` @{message.from_user.username or '—'}\n"
-            f"Бот: @{bot_username}",
-            parse_mode="Markdown",
-        )
-        await gen_bot.session.close()
+        notify_bot = Bot(token=GENERATOR_BOT_TOKEN)
+        try:
+            await notify_bot.send_message(
+                OWNER_ID,
+                f"🆕 *Новое зеркало*\n\n"
+                f"Пользователь: `{message.from_user.id}` "
+                f"@{message.from_user.username or '—'}\n"
+                f"Бот: @{bot_username}",
+                parse_mode="Markdown",
+            )
+        finally:
+            await notify_bot.session.close()
     except Exception:
         pass
 
-    log.info("Новое зеркало: user=%d bot=@%s", message.from_user.id, bot_username)
+    log.info("Новое зеркало: user=%d @%s", message.from_user.id, bot_username)
 
 
 # ── Статус зеркала ────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data == "mirror:status")
 async def mirror_status(query: CallbackQuery):
-    async with SessionLocal() as db:
-        result = await db.execute(
-            select(MirrorBot).where(MirrorBot.user_id == query.from_user.id)
-        )
-        mirror = result.scalar_one_or_none()
-
+    mirror = await get_user_mirror(query.from_user.id)
     if not mirror:
         await query.answer("Зеркало не найдено.", show_alert=True)
         return
 
-    status = "✅ Активен" if mirror.is_active else "⏸ Остановлен"
+    # Проверяем живость бота
+    alive = False
+    try:
+        async with aiohttp.ClientSession() as session:
+            resp = await session.get(
+                f"https://api.telegram.org/bot{mirror.token}/getMe",
+                timeout=aiohttp.ClientTimeout(total=5),
+            )
+            data = await resp.json()
+            alive = data.get("ok", False)
+    except Exception:
+        pass
+
+    status = "✅ Работает" if alive else "⚠️ Недоступен"
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text=f"🚀 Перейти к @{mirror.bot_username}",
-            url=f"https://t.me/{mirror.bot_username}"
+            url=f"https://t.me/{mirror.bot_username}",
         )],
-        [InlineKeyboardButton(text="🗑 Удалить", callback_data="mirror:delete")],
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data="mirror:delete_confirm")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back:start")],
     ])
     await query.message.edit_text(
         f"🤖 *Ваш бот*\n\n"
         f"Username: @{mirror.bot_username}\n"
         f"Статус: {status}\n\n"
-        f"Перейдите в бота для работы с рассылками.",
+        f"Перейдите в бота для управления рассылками.",
         reply_markup=kb,
         parse_mode="Markdown",
     )
 
 
-# ── Удаление зеркала ──────────────────────────────────────────────────────────
+# ── Удаление ──────────────────────────────────────────────────────────────────
 
-@router.callback_query(F.data == "mirror:delete")
+@router.callback_query(F.data == "mirror:delete_confirm")
+async def delete_confirm(query: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить", callback_data="mirror:delete_do")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="mirror:status")],
+    ])
+    await query.message.edit_text(
+        "⚠️ *Удалить подключённого бота?*\n\n"
+        "Задачи и аккаунты сохранятся в базе данных.\n"
+        "Вы сможете подключить другого бота.",
+        reply_markup=kb,
+        parse_mode="Markdown",
+    )
+
+
+@router.callback_query(F.data == "mirror:delete_do")
 async def delete_mirror(query: CallbackQuery):
     async with SessionLocal() as db:
         result = await db.execute(
@@ -296,29 +437,49 @@ async def delete_mirror(query: CallbackQuery):
     ])
     await query.message.edit_text(
         "✅ *Бот отключён.*\n\n"
-        "Все задачи и данные сохранены.\n"
-        "Вы можете подключить другого бота в любой момент.",
+        "Можете подключить другого бота в любой момент.",
         reply_markup=kb,
         parse_mode="Markdown",
     )
 
 
-# ── Возврат на старт ──────────────────────────────────────────────────────────
+# ── Возврат на главную ────────────────────────────────────────────────────────
 
-@router.callback_query(F.data == "start")
+@router.callback_query(F.data == "back:start")
 async def back_to_start(query: CallbackQuery, state: FSMContext):
     await state.clear()
-    # имитируем /start
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Подключить своего бота", callback_data="mirror:register")],
-        [InlineKeyboardButton(text="❓ Как это работает?", callback_data="mirror:howto")],
-    ])
-    await query.message.edit_text(
-        "👋 *Добро пожаловать в сервис рассылок!*\n\n"
-        "Нажмите *Подключить своего бота* чтобы начать.",
-        reply_markup=kb,
-        parse_mode="Markdown",
-    )
+
+    user_mirror = await get_user_mirror(query.from_user.id)
+    demo_mirror = await get_random_working_mirror(exclude_user_id=query.from_user.id)
+
+    if user_mirror:
+        text = (
+            f"👋 *Главное меню*\n\n"
+            f"Ваш бот: @{user_mirror.bot_username}"
+        )
+        kb = kb_main(True, user_mirror.bot_username)
+    else:
+        demo_line = ""
+        extra_btn = []
+        if demo_mirror and demo_mirror.bot_username:
+            demo_line = (
+                f"\n\n🚀 *Попробуйте:* "
+                f"[@{demo_mirror.bot_username}](https://t.me/{demo_mirror.bot_username})"
+            )
+            extra_btn = [[InlineKeyboardButton(
+                text=f"🚀 Попробовать (@{demo_mirror.bot_username})",
+                url=f"https://t.me/{demo_mirror.bot_username}",
+            )]]
+
+        text = f"👋 *Главное меню*{demo_line}"
+        buttons = extra_btn + [
+            [InlineKeyboardButton(text="➕ Подключить своего бота", callback_data="mirror:register")],
+            [InlineKeyboardButton(text="💳 Оплатить подписку", callback_data="pay:info")],
+            [InlineKeyboardButton(text="❓ Как это работает?", callback_data="howto")],
+        ]
+        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await query.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
 
 
 # ── Точка входа ───────────────────────────────────────────────────────────────
