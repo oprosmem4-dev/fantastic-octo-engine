@@ -7,6 +7,9 @@ services/restriction_service.py — обнаружение и обработка
   - _check_account_chat_access: нормализует chat_id из БД перед проверкой
   - check_account_on_send_error: нормализует chat_id на входе
   - handle_chat_restriction: нормализует chat_id на входе
+  - handle_chat_restriction (личный аккаунт): НЕ останавливает всю задачу —
+    убирает только недоступный чат и уведомляет пользователя с кнопкой переноса.
+    Рассылка в остальные чаты продолжается.
 """
 import asyncio
 import json
@@ -145,7 +148,6 @@ async def check_chat_access_light(
     Лёгкая проверка доступа к чату без тестовой отправки.
     chat_id нормализуется на входе (@@username → @username).
     """
-    # ── Нормализация ──────────────────────────────────────────────────────────
     chat_id = _normalize_chat_id(chat_id)
 
     entity = None
@@ -168,13 +170,12 @@ async def check_chat_access_light(
         err = str(e).lower()
         if "private" in err or "channel_private" in err:
             return False, "private"
-        # Если не нашли — не останавливаем задачу, просто логируем
         log.warning("check_chat_access_light: не удалось найти чат '%s': %s", chat_id, e)
-        return True, "resolve_failed"   # ← возвращаем True чтобы не останавливать задачу
+        return True, "resolve_failed"
 
     if entity is None:
         log.warning("check_chat_access_light: entity=None для '%s'", chat_id)
-        return True, "resolve_failed"   # ← аналогично — не останавливаем
+        return True, "resolve_failed"
 
     if isinstance(entity, tl_types.Channel):
         try:
@@ -550,6 +551,7 @@ async def handle_chat_restriction(
     reason_text = reason_labels.get(reason, reason)
 
     if account.is_system:
+        # ── Системный аккаунт: ищем замену автоматически ─────────────────────
         new_acc = await find_replacement_system_account(db, account, chat_id)
 
         if new_acc:
@@ -585,9 +587,22 @@ async def handle_chat_restriction(
                 )
             except Exception:
                 pass
+
     else:
-        task.is_active = False
+        # ── Личный аккаунт: убираем ТОЛЬКО этот чат, задачу не останавливаем ─
+        #
+        # Раньше здесь было: task.is_active = False
+        # Теперь: удаляем проблемный чат из задачи и уведомляем пользователя.
+        # Рассылка в остальные чаты продолжается без изменений.
+
+        await remove_chat_from_task(db, task, account, chat_id)
         await db.commit()
+
+        log.info(
+            "Чат %s удалён из задачи %d (личный аккаунт %s, reason=%s). "
+            "Задача продолжает работать.",
+            chat_id, task_id, account.phone, reason,
+        )
 
         if account.owner_id:
             import html
@@ -597,25 +612,45 @@ async def handle_chat_restriction(
             if len(msg_preview) > 800:
                 msg_preview = msg_preview[:800] + "…"
 
+            # Считаем сколько чатов осталось в задаче после удаления
+            remaining_result = await db.execute(
+                select(TaskAccount).where(TaskAccount.task_id == task_id)
+            )
+            remaining_tas = remaining_result.scalars().all()
+            remaining_count = sum(
+                len(json.loads(ta.chat_ids or "[]")) for ta in remaining_tas
+            )
+
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(
-                    text="🔄 Перенести рассылку на другой аккаунт",
+                    text="🔄 Перенести этот чат на другой аккаунт",
                     callback_data=f"tasks:transfer_start:{task.id}:{chat_id}",
+                )],
+                [InlineKeyboardButton(
+                    text="📋 К задачам",
+                    callback_data="tasks:list",
                 )],
                 [InlineKeyboardButton(text="◀️ Меню", callback_data="menu:new")],
             ])
 
+            remaining_note = (
+                f"Рассылка в остальные <b>{remaining_count}</b> чат(ов) продолжается."
+                if remaining_count > 0
+                else "⚠️ Других чатов в задаче не осталось."
+            )
+
             try:
                 await bot.send_message(
                     account.owner_id,
-                    f"⚠️ <b>Ограничение в чате — рассылка остановлена</b>\n\n"
+                    f"⚠️ <b>Чат недоступен — рассылка в него остановлена</b>\n\n"
                     f"Аккаунт: <code>{account.phone}</code>\n"
-                    f"Чат: {html.escape(chat_title)}\n"
+                    f"Чат: <b>{html.escape(chat_title)}</b>\n"
                     f"Задача: <b>{html.escape(task.name)}</b>\n\n"
                     f"Причина: {html.escape(reason_text)}\n\n"
+                    f"{remaining_note}\n\n"
                     f"<b>Текст рассылки:</b>\n"
                     f"<blockquote expandable>{html.escape(msg_preview)}</blockquote>\n\n"
-                    f"Нажмите кнопку ниже чтобы продолжить рассылку через другой аккаунт.",
+                    f"Нажмите кнопку ниже чтобы перенести этот чат на другой аккаунт.",
                     reply_markup=kb,
                     parse_mode="HTML",
                 )
