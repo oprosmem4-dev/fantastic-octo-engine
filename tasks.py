@@ -300,8 +300,8 @@ async def got_task_message(message: Message, state: FSMContext):
     )
     await message.answer(
         "*Шаг 3/4* — Введите интервал в минутах:\n\n"
-        "Минимум: *3 минут*\n"
-        "⚠️ Рекомендуем не менее 15 минут\n"
+        "Минимум: *1 минут*\n"
+        "⚠️ РЕКОМЕНДУЕМ ОТ 5 ДО 15 минут\n"
         "Пример: `60` = каждый час",
         reply_markup=kb_cancel(),
         parse_mode="Markdown",
@@ -312,8 +312,8 @@ async def got_task_message(message: Message, state: FSMContext):
 @router.message(CreateTask.interval)
 async def got_task_interval(message: Message, state: FSMContext):
     text = message.text.strip()
-    if not text.isdigit() or int(text) < 3:
-        await message.answer("❌ Минимум 3 минут. Введите число ≥ 3:")
+    if not text.isdigit() or int(text) < 1:
+        await message.answer("❌ Минимум 1 минут. Введите число ≥ 1:")
         return
     await state.update_data(interval=int(text))
     await message.answer(
