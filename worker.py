@@ -1,19 +1,9 @@
 """
 worker/worker.py — воркер рассылок.
 
-Как работает:
-  1. Каждые 30 секунд загружает активные задачи из БД
-  2. Для каждой задачи создаёт (или обновляет) job в APScheduler
-  3. Job отправляет сообщения через Telethon-аккаунты
-  4. Обрабатывает ошибки (FloodWait, бан, нет доступа)
-
-НОВОЕ: каждые 30 минут запускает run_full_restriction_check() из
-restriction_service — проверяет заморозку, спамблок и доступ к чатам.
-При ошибках отправки в чат также вызывается check_account_on_send_error().
-
-ИСПРАВЛЕНО: photo_file_ids — aiogram Bot API file_id, Telethon не понимает
-их напрямую. Теперь файлы скачиваются через Bot.get_file() в BytesIO
-и передаются в client.send_file() как байты.
+ИСПРАВЛЕНИЯ:
+  - resolve_entity: убрана обработка @@ (двойной @), нормализация chat_id
+  - resolve_entity: @username теперь всегда стрипается до одного @
 """
 import asyncio
 import io
@@ -43,11 +33,6 @@ _restriction_check_running = False
 # ── Загрузка фото через Bot API ───────────────────────────────────────────────
 
 async def download_photos(file_ids: list[str]) -> list[io.BytesIO]:
-    """
-    Скачать фото по aiogram file_id через Bot API.
-    Возвращает список BytesIO объектов готовых для передачи в Telethon.
-    Файлы без расширения получат имя photo_N.jpg.
-    """
     if not file_ids:
         return []
 
@@ -60,7 +45,6 @@ async def download_photos(file_ids: list[str]) -> list[io.BytesIO]:
                 buf = io.BytesIO()
                 await bot.download_file(tg_file.file_path, destination=buf)
                 buf.seek(0)
-                # Telethon определяет тип файла по имени атрибута name
                 buf.name = f"photo_{i}.jpg"
                 results.append(buf)
             except Exception as e:
@@ -157,9 +141,6 @@ async def run_task(task_id: int):
             log.warning("Задача %d: нет аккаунтов", task_id)
             return
 
-        # ── Скачиваем фото ОДИН РАЗ для всех аккаунтов ───────────────────────
-        # file_id из Bot API нельзя передать напрямую в Telethon,
-        # поэтому скачиваем байты заранее и переиспользуем для каждого чата.
         message_text = task.message or ""
         try:
             photo_file_ids = json.loads(task.photo_file_ids or "[]")
@@ -170,7 +151,6 @@ async def run_task(task_id: int):
         except Exception:
             format_entities_json = []
 
-        # Скачиваем фото в память (BytesIO) если они есть
         photo_bytes: list[io.BytesIO] = []
         if photo_file_ids:
             photo_bytes = await download_photos(photo_file_ids)
@@ -225,7 +205,6 @@ async def send_via_account(
         await client.get_dialogs()
 
         for chat_id in chat_ids:
-            # Перематываем BytesIO в начало перед каждой отправкой
             for buf in photo_bytes:
                 buf.seek(0)
 
@@ -256,12 +235,6 @@ async def send_to_chat(
     photo_bytes: list[io.BytesIO],
     entities_json: list[dict],
 ):
-    """
-    Отправить одно сообщение в один чат.
-
-    photo_bytes — список BytesIO уже скачанных фото.
-    При каждом вызове seek(0) должен быть сделан снаружи.
-    """
     success = False
     error_text = None
 
@@ -273,8 +246,6 @@ async def send_to_chat(
         else:
             entities = _to_telethon_entities(entities_json)
             if photo_bytes:
-                # Одно фото — send_file с одним файлом
-                # Несколько — send_file принимает список (альбом)
                 files = photo_bytes if len(photo_bytes) > 1 else photo_bytes[0]
                 await client.send_file(
                     entity,
@@ -294,7 +265,6 @@ async def send_to_chat(
     except FloodWaitError as e:
         log.warning("FloodWait %d сек. для %s", e.seconds, account.phone)
         await asyncio.sleep(e.seconds)
-        # Перематываем перед повтором
         for buf in photo_bytes:
             buf.seek(0)
         try:
@@ -344,7 +314,6 @@ async def send_to_chat(
 
 
 def _to_telethon_entities(entities_json: list[dict]) -> list:
-    """JSON entities → telethon.tl.types.MessageEntity*"""
     out = []
     for e in entities_json or []:
         t = (e.get("type") or "").lower()
@@ -376,11 +345,28 @@ def _to_telethon_entities(entities_json: list[dict]) -> list:
     return out
 
 
+def _normalize_chat_id(chat_id: str) -> str:
+    """
+    Нормализовать chat_id перед резолвом:
+      - убрать лишние @ (@@username → @username)
+      - убрать пробелы
+    """
+    chat_id = chat_id.strip()
+    # Убираем повторяющиеся @ в начале
+    if chat_id.startswith("@"):
+        username = chat_id.lstrip("@")
+        return f"@{username}"
+    return chat_id
+
+
 async def resolve_entity(client, chat_id: str):
     """
     Найти чат по ID или username.
+    Нормализует chat_id перед поиском (убирает двойной @@).
     """
-    chat_id = str(chat_id).strip()
+    chat_id = _normalize_chat_id(chat_id)
+
+    log.debug("resolve_entity: '%s'", chat_id)
 
     if chat_id.startswith("@"):
         try:
