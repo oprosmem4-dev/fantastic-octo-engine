@@ -1,11 +1,9 @@
 """
 bot/handlers/tasks.py — создание и управление задачами рассылок.
 
-ИЗМЕНЕНИЯ:
-  - view_task: чаты показываются как гиперссылки "@username" или просто названия,
-    числовые ID нигде не отображаются пользователю.
-  - got_task_chats: для папок передаём полные данные (username, folder_slug).
-  - confirm_chats: недоступные чаты показываются с названием/ссылкой, без ID.
+ИСПРАВЛЕНИЯ:
+  - got_task_chats: chat_id при ручном вводе всегда нормализуется (убираем @@)
+  - _normalize_chat_id: вспомогательная функция для единообразия
 """
 import logging
 import json
@@ -54,15 +52,23 @@ async def cb_cancel_to_menu(query: CallbackQuery, state: FSMContext, user: User)
     )
 
 
-# ── Утилита: отображаемое имя чата ───────────────────────────────────────────
+# ── Утилиты ───────────────────────────────────────────────────────────────────
+
+def _normalize_chat_id(raw: str) -> str:
+    """
+    Нормализовать введённый пользователем chat_id.
+    @@username → @username
+    @username  → @username
+    -100123    → -100123
+    """
+    s = raw.strip()
+    if s.startswith("@"):
+        username = s.lstrip("@")
+        return f"@{username}"
+    return s
+
 
 def _chat_display(title: str, username: str | None, link: str | None) -> str:
-    """
-    Формирует строку для отображения чата в боте:
-      • Если есть username → гиперссылка [title](https://t.me/username)
-      • Если есть link     → гиперссылка [title](link)
-      • Иначе              → просто title
-    """
     url = f"https://t.me/{username}" if username else link
     if url:
         return f"[{title}]({url})"
@@ -70,15 +76,11 @@ def _chat_display(title: str, username: str | None, link: str | None) -> str:
 
 
 def _chat_display_from_task_chat(c) -> str:
-    """
-    Отображение чата из объекта TaskChat.
-    chat_title хранится как "@username" или просто название.
-    """
     ct = c.chat_title or ""
     if ct.startswith("@"):
         uname = ct.lstrip("@")
         return f"[{ct}](https://t.me/{uname})"
-    return ct or c.chat_id  # числовой ID только если совсем нет данных
+    return ct or c.chat_id
 
 
 # ── Список задач ──────────────────────────────────────────────────────────────
@@ -110,7 +112,6 @@ async def view_task(query: CallbackQuery, state: FSMContext, user: User, db: Asy
 
     icon = "▶️" if task.is_active else "⏸"
 
-    # Список чатов — показываем названия/ссылки, БЕЗ числовых ID
     chats_lines = []
     for c in task.chats[:15]:
         display = _chat_display_from_task_chat(c)
@@ -120,7 +121,6 @@ async def view_task(query: CallbackQuery, state: FSMContext, user: User, db: Asy
     if len(task.chats) > 15:
         chats_block += f"\n…и ещё {len(task.chats) - 15}"
 
-    # Аккаунты — показываем телефон и количество чатов
     acc_lines = []
     for link in task.accounts:
         try:
@@ -379,13 +379,16 @@ async def got_task_chats(message: Message, state: FSMContext, user: User, db: As
             line = line.strip()
             if not line:
                 continue
-            username = None
+
+            # Нормализуем сразу при вводе — убираем лишние @
             if line.startswith("@"):
-                username = line.lstrip("@")
-                chat_id  = f"@{username}"
+                username = line.lstrip("@")   # убираем все @
+                chat_id  = f"@{username}"      # ровно один @
             elif line.lstrip("-").isdigit():
-                chat_id = line
+                username = None
+                chat_id  = line
             else:
+                # просто слово без @ — трактуем как username
                 username = line.lstrip("@")
                 chat_id  = f"@{username}"
 
@@ -406,7 +409,7 @@ async def got_task_chats(message: Message, state: FSMContext, user: User, db: As
 
     await state.update_data(chats=chats)
 
-    # Превью — показываем названия/username, без числовых ID
+    # Превью
     preview_lines = []
     for c in chats[:10]:
         uname = c.get("username")
@@ -465,7 +468,6 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
 
     sender_account_id = data.get("sender_account_id")
 
-    # Аккаунт для проверки доступа
     check_account = None
     if sender_account_id is not None:
         check_account = await account_service.get_account_by_id(db, sender_account_id)
@@ -520,7 +522,6 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
     inaccessible = [r for r in results if not r["can_write"]]
 
     def _fmt_chat(r: dict) -> str:
-        """Отформатировать строку чата без числового ID."""
         uname = r.get("username")
         title = r.get("title") or (f"@{uname}" if uname else "—")
         link  = f"https://t.me/{uname}" if uname else r.get("link")
@@ -528,7 +529,6 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
             return f"[{title}]({link})"
         return title
 
-    # Все недоступны
     if not accessible:
         await state.clear()
         lines = []
@@ -568,7 +568,6 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
         )
         return
 
-    # Часть недоступна
     if inaccessible:
         lines = []
         for r in inaccessible[:20]:
@@ -588,7 +587,6 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
         )
         return
 
-    # Всё OK
     preview_lines = [f"• {_fmt_chat(r)}" for r in accessible[:10]]
     if len(accessible) > 10:
         preview_lines.append(f"…и ещё {len(accessible) - 10}")
