@@ -1,23 +1,20 @@
 """
 bot/mirror_runner.py — запуск всех зеркальных ботов из БД.
 
-Архитектура:
-  - Каждое зеркало запускается в отдельном asyncio.Task
-  - При падении — автоматический перезапуск через RESTART_DELAY секунд
-  - Graceful shutdown по SIGINT/SIGTERM
-  - Один общий Dispatcher + роутеры, но отдельный Bot-объект для каждого зеркала
-    → экономия памяти (роутеры не дублируются)
-  - Watch-loop каждые 30 секунд синхронизирует запущенные зеркала с БД
+ИСПРАВЛЕНИЕ: dp.start_polling() блокировал event loop → каждое зеркало теперь
+запускается через собственный polling loop в asyncio.Task.
+Все зеркала работают ОДНОВРЕМЕННО.
 
-Масштабирование:
-  - До ~500 зеркал на одном инстансе нормально (asyncio, не потоки)
-  - При необходимости можно запустить несколько mirror_runner на разных машинах,
-    разбив по диапазону user_id (задаётся через MIRROR_SHARD_* в .env)
+Архитектура:
+  - Один Dispatcher + роутеры создаётся ОДИН РАЗ (экономия ~5 МБ на зеркало)
+  - Каждый Bot получает отдельный asyncio.Task с polling loop
+  - При падении — автоматический перезапуск через RESTART_DELAY секунд
+  - Watch-loop каждые 30 сек синхронизирует запущенные зеркала с БД
+  - Graceful shutdown по SIGINT/SIGTERM
 """
 import asyncio
 import logging
 import signal
-from typing import Optional
 
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -32,21 +29,22 @@ from bot.handlers import payment as payment_handler
 
 log = logging.getLogger(__name__)
 
-# ── Общий Dispatcher для всех зеркал ─────────────────────────────────────────
-# Роутеры создаются один раз и шарятся между всеми Bot-инстансами.
-# Это экономит ~5-10 МБ RAM на каждое зеркало.
+# ── Shared Dispatcher (создаётся один раз для всех зеркал) ───────────────────
 
-_shared_dp: Optional[Dispatcher] = None
+_shared_dp: Dispatcher | None = None
 
 
-def _build_shared_dp() -> Dispatcher:
+def get_shared_dp() -> Dispatcher:
+    global _shared_dp
+    if _shared_dp is not None:
+        return _shared_dp
+
     dp = Dispatcher(storage=MemoryStorage())
 
     dp.message.middleware(AuthMiddleware())
     dp.callback_query.middleware(AuthMiddleware())
 
-    # Флаг IS_MIRROR блокирует оплату во всех зеркалах
-    payment_handler.IS_MIRROR = True
+    payment_handler.IS_MIRROR = True  # оплата заблокирована во всех зеркалах
 
     dp.include_router(start.router)
     dp.include_router(accounts.router)
@@ -55,64 +53,73 @@ def _build_shared_dp() -> Dispatcher:
     dp.include_router(admin.router)
     dp.include_router(mirror.router)
 
+    _shared_dp = dp
     return dp
-
-
-def get_shared_dp() -> Dispatcher:
-    global _shared_dp
-    if _shared_dp is None:
-        _shared_dp = _build_shared_dp()
-    return _shared_dp
 
 
 # ── Реестр запущенных зеркал ──────────────────────────────────────────────────
 
-# mirror_id → asyncio.Task
-_running: dict[int, asyncio.Task] = {}
-
-# mirror_id → количество рестартов (для логов)
-_restart_count: dict[int, int] = {}
-
-# Флаг остановки
+_running: dict[int, asyncio.Task] = {}   # mirror_id → Task
+_restarts: dict[int, int] = {}           # mirror_id → кол-во рестартов
 _shutdown = False
 
 
-# ── Запуск одного зеркала ─────────────────────────────────────────────────────
+# ── Polling loop для одного бота ──────────────────────────────────────────────
+
+async def _polling_loop(bot: Bot, dp: Dispatcher):
+    """
+    Неблокирующий polling loop.
+    Получает updates и передаёт их в dp.feed_update через отдельные Task-и.
+    Выходит только при CancelledError.
+    """
+    offset = 0
+    allowed = dp.resolve_used_update_types()
+
+    while True:
+        try:
+            updates = await bot.get_updates(
+                offset=offset,
+                timeout=30,
+                allowed_updates=allowed,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.debug("get_updates ошибка: %s", e)
+            await asyncio.sleep(5)
+            continue
+
+        for update in updates:
+            offset = update.update_id + 1
+            # Обрабатываем каждый update в отдельной задаче — не блокируем polling
+            asyncio.create_task(dp.feed_update(bot, update))
+
 
 async def _run_mirror_forever(mirror_id: int, token: str, username: str, user_id: int):
     """
-    Запускает одно зеркало и перезапускает его при падении.
-    Выходит только если _shutdown=True или зеркало удалено из БД.
+    Запускает polling для одного зеркала.
+    При любом падении — перезапуск через RESTART_DELAY секунд.
+    Выходит только при CancelledError или _shutdown=True.
     """
-    global _shutdown
+    dp = get_shared_dp()
 
     while not _shutdown:
+        bot = Bot(token=token)
         try:
             log.info("▶️  Запуск зеркала @%s (mirror_id=%d, user=%d)", username, mirror_id, user_id)
-
-            bot = Bot(token=token)
-            dp  = get_shared_dp()
-
-            await dp.start_polling(
-                bot,
-                allowed_updates=dp.resolve_used_update_types(),
-                # Не останавливать polling при исключении — пусть падает наверх
-            )
+            await bot.delete_webhook(drop_pending_updates=False)
+            await _polling_loop(bot, dp)
 
         except asyncio.CancelledError:
-            log.info("⏹  Зеркало @%s остановлено (CancelledError)", username)
+            log.info("⏹  Зеркало @%s остановлено", username)
             break
 
         except Exception as e:
             if _shutdown:
                 break
-
-            count = _restart_count.get(mirror_id, 0) + 1
-            _restart_count[mirror_id] = count
-            log.error(
-                "❌ Зеркало @%s упало (попытка %d): %s — перезапуск через %ds",
-                username, count, e, MIRROR_RESTART_DELAY,
-            )
+            cnt = _restarts.get(mirror_id, 0) + 1
+            _restarts[mirror_id] = cnt
+            log.error("❌ Зеркало @%s упало (рестарт #%d): %s", username, cnt, e)
             await asyncio.sleep(MIRROR_RESTART_DELAY)
 
         finally:
@@ -122,18 +129,18 @@ async def _run_mirror_forever(mirror_id: int, token: str, username: str, user_id
                 pass
 
 
+# ── Управление зеркалами ──────────────────────────────────────────────────────
+
 async def _start_mirror(m: MirrorBot):
-    """Создать asyncio.Task для зеркала."""
     task = asyncio.create_task(
         _run_mirror_forever(m.id, m.token, m.bot_username or "?", m.user_id),
         name=f"mirror_{m.id}",
     )
     _running[m.id] = task
-    _restart_count.setdefault(m.id, 0)
+    _restarts.setdefault(m.id, 0)
 
 
 async def _stop_mirror(mirror_id: int):
-    """Отменить задачу зеркала."""
     task = _running.pop(mirror_id, None)
     if task and not task.done():
         task.cancel()
@@ -141,38 +148,32 @@ async def _stop_mirror(mirror_id: int):
             await asyncio.wait_for(asyncio.shield(task), timeout=5)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
-    _restart_count.pop(mirror_id, None)
-    log.info("⏹  Зеркало mirror_id=%d остановлено", mirror_id)
+    _restarts.pop(mirror_id, None)
+    log.info("⏹  mirror_id=%d остановлен", mirror_id)
 
 
 # ── Watch-loop ────────────────────────────────────────────────────────────────
 
 async def watch_mirrors():
-    """
-    Каждые 30 секунд синхронизирует запущенные зеркала с БД.
-    Поддерживает шардирование по user_id для горизонтального масштабирования.
-    """
     global _shutdown
 
     await create_all_tables()
     log.info(
-        "Mirror runner стартовал. Shard: user_id [%s, %s]",
+        "Mirror runner стартовал. Shard: [%s, %s)",
         MIRROR_SHARD_MIN or "0",
         MIRROR_SHARD_MAX or "∞",
     )
 
+    iteration = 0
     while not _shutdown:
         try:
             async with SessionLocal() as db:
                 q = select(MirrorBot).where(MirrorBot.is_active == True)
-
-                # Шардирование — опционально
                 if MIRROR_SHARD_MIN is not None:
                     q = q.where(MirrorBot.user_id >= MIRROR_SHARD_MIN)
                 if MIRROR_SHARD_MAX is not None:
                     q = q.where(MirrorBot.user_id < MIRROR_SHARD_MAX)
-
-                result  = await db.execute(q)
+                result = await db.execute(q)
                 db_mirrors = {m.id: m for m in result.scalars().all()}
 
             # Останавливаем удалённые / деактивированные
@@ -180,32 +181,32 @@ async def watch_mirrors():
                 if mid not in db_mirrors:
                     await _stop_mirror(mid)
 
-            # Запускаем новые (ещё не запущенные)
+            # Запускаем новые или перезапускаем упавшие задачи
             for mid, m in db_mirrors.items():
                 if mid not in _running:
                     await _start_mirror(m)
                 elif _running[mid].done():
-                    # Задача завершилась неожиданно — перезапускаем
-                    log.warning("Задача mirror_id=%d мертва — перезапускаю", mid)
-                    _running.pop(mid)
+                    log.warning("Задача mirror_id=%d мертва — перезапуск", mid)
+                    del _running[mid]
                     await _start_mirror(m)
 
-            # Логируем статус раз в 5 минут (каждые 10 итераций по 30 сек)
-            if int(asyncio.get_event_loop().time()) % 300 < 30:
-                alive  = sum(1 for t in _running.values() if not t.done())
-                dead   = sum(1 for t in _running.values() if t.done())
-                total_restarts = sum(_restart_count.values())
+            # Статус каждые ~5 минут
+            iteration += 1
+            if iteration % 10 == 0:
+                alive = sum(1 for t in _running.values() if not t.done())
+                problems = {k: v for k, v in _restarts.items() if v > 0}
                 log.info(
-                    "📊 Зеркала: %d активных, %d проблемных, %d рестартов всего",
-                    alive, dead, total_restarts,
+                    "📊 Активных зеркал: %d/%d | Рестарты: %s",
+                    alive, len(_running),
+                    problems or "нет",
                 )
 
         except Exception as e:
-            log.error("Ошибка в watch_mirrors: %s", e)
+            log.error("Ошибка watch_mirrors: %s", e)
 
         await asyncio.sleep(30)
 
-    # Graceful shutdown — останавливаем все зеркала
+    # Graceful shutdown
     log.info("🛑 Останавливаю все зеркала...")
     await asyncio.gather(
         *[_stop_mirror(mid) for mid in list(_running.keys())],
@@ -218,21 +219,18 @@ async def watch_mirrors():
 
 async def main():
     global _shutdown
-
-    # Обработка сигналов для graceful shutdown
     loop = asyncio.get_running_loop()
 
-    def _handle_signal():
+    def _on_signal():
         global _shutdown
         _shutdown = True
         log.info("Получен сигнал завершения.")
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, _handle_signal)
+            loop.add_signal_handler(sig, _on_signal)
         except NotImplementedError:
-            # Windows не поддерживает add_signal_handler
-            pass
+            pass  # Windows
 
     await watch_mirrors()
 
