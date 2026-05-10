@@ -1,13 +1,12 @@
 """
 services/restriction_service.py — обнаружение и обработка ограничений на аккаунтах.
 
-Типы ограничений:
-  1. Заморозка (frozen)    — аккаунт деактивирован Telegram-ом
-  2. Спамблок (spamblocked) — ограничение на отправку сообщений
-  3. Ограничения в чате    — бан, мут или исключение из конкретного чата
-
-Периодическая проверка запускается из воркера каждые 30 минут.
-Также вызывается из send_to_chat при ошибке отправки.
+ИСПРАВЛЕНИЯ:
+  - _normalize_chat_id: нормализует @@username → @username перед любым использованием
+  - check_chat_access_light: нормализует chat_id на входе
+  - _check_account_chat_access: нормализует chat_id из БД перед проверкой
+  - check_account_on_send_error: нормализует chat_id на входе
+  - handle_chat_restriction: нормализует chat_id на входе
 """
 import asyncio
 import json
@@ -34,15 +33,26 @@ from services.account_service import make_client
 
 log = logging.getLogger(__name__)
 
-# Кулдаун между проверками спамблока для одного аккаунта (секунды).
-# Предотвращает спам @SpamBot при частых ошибках отправки.
 _SPAMCHECK_COOLDOWN = 1800  # 30 минут
-_last_spamcheck: dict[int, float] = {}  # account_id → unix timestamp
+_last_spamcheck: dict[int, float] = {}
 
 
 def _get_bot() -> Bot:
-    """Создать Bot-экземпляр для отправки уведомлений из воркера."""
     return Bot(token=BOT_TOKEN)
+
+
+def _normalize_chat_id(chat_id: str) -> str:
+    """
+    Нормализовать chat_id:
+      @@username  → @username
+      @@@username → @username
+      -100123456  → -100123456  (без изменений)
+    """
+    s = str(chat_id).strip()
+    if s.startswith("@"):
+        username = s.lstrip("@")
+        return f"@{username}"
+    return s
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -50,10 +60,6 @@ def _get_bot() -> Bot:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def is_account_frozen(client: TelegramClient) -> bool:
-    """
-    True если аккаунт заморожен Telegram-ом.
-    Проверяется через get_me() — при заморозке возвращает ошибку или None.
-    """
     try:
         me = await client.get_me()
         return me is None
@@ -69,32 +75,10 @@ async def is_account_frozen(client: TelegramClient) -> bool:
 
 
 async def is_account_spamblocked(client: TelegramClient) -> bool:
-    """
-    True если аккаунт в спамблоке.
-
-    Алгоритм:
-      1. Отправляем /start в @SpamBot — читаем ответ.
-         Если говорит об ограничениях → спамблок.
-      2. Отправляем "check" в SPAMCHECK_USERNAME (личный аккаунт).
-         Если ошибка → спамблок (даже если @SpamBot говорит OK).
-    """
     if not SPAMCHECK_USERNAME:
         log.warning("SPAMCHECK_USERNAME не задан в .env — проверка спамблока пропущена")
         return False
 
-    # ── Шаг 1: @SpamBot ──────────────────────────────────────────────────────
-    # Логика: ищем ЯВНЫЕ признаки ограничения, а НЕ ключевые слова из
-    # "нормального" ответа. Фраза "свободен от каких-либо ограничений"
-    # является признаком отсутствия блокировки, а не её наличия.
-    #
-    # Фразы-маркеры СПАМБЛОКА (русский и английский интерфейс @SpamBot):
-    #   RU: "ваш аккаунт ограничен", "ограничения на отправку",
-    #       "заблокирован от", "не можете отправлять"
-    #   EN: "your account is limited", "you can't send", "your account has been limited"
-    #
-    # Фразы-маркеры НОРМАЛЬНОГО состояния (→ НЕ спамблок):
-    #   RU: "свободен от", "нет ограничений", "все в порядке"
-    #   EN: "good standing", "no limits", "free of"
     spambot_restricted = False
     try:
         await client.send_message("SpamBot", "/start")
@@ -110,29 +94,15 @@ async def is_account_spamblocked(client: TelegramClient) -> bool:
             hash=0,
         ))
 
-        # Фразы которые точно означают ОК — если есть хоть одна, спамблока нет
         OK_PHRASES = [
-            "свободен от",
-            "нет ограничений",
-            "все в порядке",
-            "всё в порядке",
-            "good standing",
-            "no limits",
-            "free of",
-            "no restrictions",
-            "not limited",
+            "свободен от", "нет ограничений", "все в порядке", "всё в порядке",
+            "good standing", "no limits", "free of", "no restrictions", "not limited",
         ]
-        # Фразы которые точно означают СПАМБЛОК
         BAN_PHRASES = [
-            "ваш аккаунт ограничен",
-            "аккаунт ограничен",
-            "ограничения на отправку",
-            "заблокирован от отправки",
-            "не можете отправлять сообщения",
-            "your account is limited",
-            "your account has been limited",
-            "you can't send messages",
-            "you cannot send messages",
+            "ваш аккаунт ограничен", "аккаунт ограничен", "ограничения на отправку",
+            "заблокирован от отправки", "не можете отправлять сообщения",
+            "your account is limited", "your account has been limited",
+            "you can't send messages", "you cannot send messages",
             "sending messages has been limited",
         ]
 
@@ -140,16 +110,10 @@ async def is_account_spamblocked(client: TelegramClient) -> bool:
             txt = (msg.message or "").lower()
             if not txt:
                 continue
-
-            # Сначала проверяем ОК — если явно написано что всё хорошо, выходим
             if any(phrase in txt for phrase in OK_PHRASES):
-                log.debug("SpamBot: аккаунт в порядке ('%s...')", txt[:60])
                 spambot_restricted = False
                 break
-
-            # Затем проверяем BAN
             if any(phrase in txt for phrase in BAN_PHRASES):
-                log.info("SpamBot: обнаружен спамблок ('%s...')", txt[:60])
                 spambot_restricted = True
                 break
 
@@ -162,13 +126,11 @@ async def is_account_spamblocked(client: TelegramClient) -> bool:
     if spambot_restricted:
         return True
 
-    # ── Шаг 2: тестовая отправка (главный критерий) ───────────────────────────
     target = SPAMCHECK_USERNAME.lstrip("@")
     try:
         await client.send_message(target, "check")
-        return False  # Отправилось → спамблока нет
+        return False
     except FloodWaitError:
-        # FloodWait ≠ спамблок, просто лимит частоты
         return False
     except Exception as e:
         log.info("Ошибка отправки в spamcheck (%s): %s → считаем спамблоком", target, e)
@@ -180,14 +142,17 @@ async def check_chat_access_light(
     chat_id: str,
 ) -> tuple[bool, str]:
     """
-    Лёгкая проверка доступа к чату — без тестовой отправки сообщений.
-    Использует GetParticipant + проверку banned_rights.
-    Returns (can_write, reason).
+    Лёгкая проверка доступа к чату без тестовой отправки.
+    chat_id нормализуется на входе (@@username → @username).
     """
-    # Получаем entity
+    # ── Нормализация ──────────────────────────────────────────────────────────
+    chat_id = _normalize_chat_id(chat_id)
+
     entity = None
     try:
-        if not chat_id.lstrip("-").isdigit():
+        if chat_id.startswith("@"):
+            entity = await client.get_entity(chat_id)
+        elif not chat_id.lstrip("-").isdigit():
             entity = await client.get_entity(f"@{chat_id}")
         else:
             try:
@@ -203,12 +168,14 @@ async def check_chat_access_light(
         err = str(e).lower()
         if "private" in err or "channel_private" in err:
             return False, "private"
-        return False, str(e)[:60]
+        # Если не нашли — не останавливаем задачу, просто логируем
+        log.warning("check_chat_access_light: не удалось найти чат '%s': %s", chat_id, e)
+        return True, "resolve_failed"   # ← возвращаем True чтобы не останавливать задачу
 
     if entity is None:
-        return False, "not_found"
+        log.warning("check_chat_access_light: entity=None для '%s'", chat_id)
+        return True, "resolve_failed"   # ← аналогично — не останавливаем
 
-    # Для каналов и супергрупп проверяем участника
     if isinstance(entity, tl_types.Channel):
         try:
             me = await client.get_me()
@@ -221,7 +188,6 @@ async def check_chat_access_light(
             if isinstance(p, tl_types.ChannelParticipantBanned):
                 return False, "banned"
 
-            # banned_rights: send_messages=True означает что писать нельзя
             banned_rights = getattr(p, "banned_rights", None)
             if banned_rights and getattr(banned_rights, "send_messages", False):
                 return False, "write_forbidden"
@@ -234,7 +200,6 @@ async def check_chat_access_light(
                 return False, "private"
             if "banned" in err:
                 return False, "banned"
-            # GetParticipant может не работать в обычных группах — не страшно
             log.debug("GetParticipant %s: %s (игнорируем)", chat_id, e)
 
     return True, "ok"
@@ -245,15 +210,10 @@ async def check_chat_access_light(
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def stop_account_tasks(db: AsyncSession, account: Account) -> int:
-    """
-    Остановить все активные задачи, в которых участвует аккаунт.
-    Returns: количество остановленных задач.
-    """
     result = await db.execute(
         select(TaskAccount).where(TaskAccount.account_id == account.id)
     )
     task_accounts = result.scalars().all()
-
     task_ids = {ta.task_id for ta in task_accounts}
     stopped = 0
 
@@ -271,11 +231,6 @@ async def stop_account_tasks(db: AsyncSession, account: Account) -> int:
 
 
 async def redistribute_system_chats(db: AsyncSession, blocked_account: Account) -> int:
-    """
-    Равномерно перераспределить чаты заблокированного системного аккаунта
-    на другие доступные системные аккаунты (round-robin по нагрузке).
-    Returns: количество аккаунтов, получивших чаты.
-    """
     result = await db.execute(
         select(TaskAccount).where(TaskAccount.account_id == blocked_account.id)
     )
@@ -311,10 +266,7 @@ async def redistribute_system_chats(db: AsyncSession, blocked_account: Account) 
             await db.delete(ta)
             continue
 
-        # Round-robin: распределяем по одному чату на аккаунт поочерёдно,
-        # всегда отдавая следующему наименее загруженному
         for i, chat_id in enumerate(chat_ids):
-            # Сортируем по текущей нагрузке
             available.sort(key=lambda a: a.chats_count)
             acc = available[i % len(available)]
 
@@ -353,11 +305,9 @@ async def find_replacement_system_account(
     excluded_account: Account,
     chat_id: str,
 ) -> Optional[Account]:
-    """
-    Найти другой системный аккаунт, который реально может писать в чат.
-    Использует полную проверку can_write_to_chat с тестовой отправкой.
-    """
     from services.account_service import can_write_to_chat
+
+    chat_id = _normalize_chat_id(chat_id)
 
     result = await db.execute(
         select(Account).where(
@@ -396,8 +346,8 @@ async def transfer_chat_to_account(
     new_account: Account,
     chat_id: str,
 ):
-    """Перенести один чат с одного аккаунта на другой в рамках задачи."""
-    # Удаляем из старого TaskAccount
+    chat_id = _normalize_chat_id(chat_id)
+
     result = await db.execute(
         select(TaskAccount).where(
             TaskAccount.task_id == task.id,
@@ -413,7 +363,6 @@ async def transfer_chat_to_account(
         if not old_ids:
             await db.delete(old_ta)
 
-    # Добавляем к новому TaskAccount
     result = await db.execute(
         select(TaskAccount).where(
             TaskAccount.task_id == task.id,
@@ -442,7 +391,8 @@ async def remove_chat_from_task(
     account: Account,
     chat_id: str,
 ):
-    """Удалить чат из задачи (из TaskAccount и TaskChat)."""
+    chat_id = _normalize_chat_id(chat_id)
+
     result = await db.execute(
         select(TaskAccount).where(
             TaskAccount.task_id == task.id,
@@ -470,18 +420,12 @@ async def remove_chat_from_task(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ОБРАБОТЧИКИ ОГРАНИЧЕНИЙ (с уведомлениями)
+# ОБРАБОТЧИКИ ОГРАНИЧЕНИЙ
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def handle_frozen_account(db: AsyncSession, account: Account, bot: Bot):
-    """
-    Действия при заморозке аккаунта:
-    - Помечаем status="frozen", is_banned=True, is_active=False
-    - Останавливаем все активные задачи
-    - Уведомляем владельца / администратора
-    """
     if account.status == "frozen":
-        return  # уже обработано ранее
+        return
 
     log.warning("❄️  Аккаунт %s (id=%d) заморожен", account.phone, account.id)
     account.status = "frozen"
@@ -522,14 +466,8 @@ async def handle_frozen_account(db: AsyncSession, account: Account, bot: Bot):
 
 
 async def handle_spamblocked_account(db: AsyncSession, account: Account, bot: Bot):
-    """
-    Действия при спамблоке:
-    - Помечаем status="spamblocked"
-    - Системный: перераспределяем чаты на другие системные аккаунты
-    - Пользовательский: останавливаем задачи, уведомляем
-    """
     if account.status == "spamblocked":
-        return  # уже обработано
+        return
 
     log.warning("🚫  Аккаунт %s (id=%d) в спамблоке", account.phone, account.id)
     account.status = "spamblocked"
@@ -559,12 +497,8 @@ async def handle_spamblocked_account(db: AsyncSession, account: Account, bot: Bo
                     f"🚫 *Ваш аккаунт получил спамблок*\n\n"
                     f"📱 `{account.phone}`\n\n"
                     f"Telegram ограничил возможность отправки сообщений с этого аккаунта.\n"
-                    f"Ограничение *может быть постоянным*.\n\n"
                     f"Остановлено задач: *{stopped}*\n\n"
-                    f"💡 *Рекомендации:*\n"
-                    f"• Не ставьте интервал рассылки менее 15 минут\n"
-                    f"• Будьте аккуратны в чатах с жёсткими администраторами\n"
-                    f"• Попробуйте снять ограничение через @SpamBot\n\n"
+                    f"💡 Попробуйте снять ограничение через @SpamBot\n\n"
                     f"Управление аккаунтами: /accounts",
                     parse_mode="Markdown",
                 )
@@ -580,21 +514,22 @@ async def handle_chat_restriction(
     reason: str,
     bot: Bot,
 ):
-    """
-    Действия при ограничении аккаунта в конкретном чате.
+    # Нормализуем сразу на входе
+    chat_id = _normalize_chat_id(chat_id)
 
-    Системный аккаунт: пытаемся найти замену среди системных.
-      - Нашли → переносим чат, уведомляем пользователя.
-      - Не нашли → удаляем чат из задачи, уведомляем пользователя.
-    Пользовательский аккаунт: удаляем чат, уведомляем владельца.
-    """
-    # Получаем задачу
+    # resolve_failed означает что чат просто не нашли — не останавливаем задачу
+    if reason == "resolve_failed":
+        log.warning(
+            "handle_chat_restriction: reason=resolve_failed для '%s' acc=%s — пропускаем",
+            chat_id, account.phone,
+        )
+        return
+
     result = await db.execute(select(Task).where(Task.id == task_id))
     task = result.scalar_one_or_none()
     if not task:
         return
 
-    # Получаем название чата
     result = await db.execute(
         select(TaskChat).where(
             TaskChat.task_id == task_id,
@@ -605,32 +540,22 @@ async def handle_chat_restriction(
     chat_title = (tc.chat_title or str(chat_id)) if tc else str(chat_id)
 
     reason_labels = {
-        "banned":          "аккаунт заблокирован администратором чата",
-        "write_forbidden": "нет прав на отправку сообщений",
-        "kicked":          "аккаунт исключён из чата",
-        "private":         "чат стал приватным",
-        "not_found":       "чат не найден",
+        "banned":            "аккаунт заблокирован администратором чата",
+        "write_forbidden":   "нет прав на отправку сообщений",
+        "kicked":            "аккаунт исключён из чата",
+        "private":           "чат стал приватным",
+        "not_found":         "чат не найден",
         "too_many_channels": "аккаунт состоит в слишком многих чатах",
     }
     reason_text = reason_labels.get(reason, reason)
 
     if account.is_system:
-        # Ищем другой системный аккаунт, который реально может писать
         new_acc = await find_replacement_system_account(db, account, chat_id)
 
         if new_acc:
             await transfer_chat_to_account(db, task, account, new_acc, chat_id)
             await db.commit()
-            log.info(
-                "Чат %s перенесён с %s на %s (задача %d)",
-                chat_id, account.phone, new_acc.phone, task_id,
-            )
-
-            # Формируем отображаемое имя нового аккаунта
-            new_acc_display = f"`{new_acc.phone}`"
-            if getattr(new_acc, "username", None):
-                new_acc_display += f" (@{new_acc.username})"
-
+            log.info("Чат %s перенесён с %s на %s (задача %d)", chat_id, account.phone, new_acc.phone, task_id)
             try:
                 await bot.send_message(
                     task.user_id,
@@ -638,64 +563,47 @@ async def handle_chat_restriction(
                     f"Задача: *{task.name}*\n"
                     f"Чат: {chat_title}\n\n"
                     f"Причина: {reason_text}\n\n"
-                    f"❌ Старый аккаунт: `{account.phone}`\n"
-                    f"✅ Новый аккаунт: {new_acc_display}\n\n"
-                    f"Рассылка в этот чат продолжается автоматически.\n"
-                    f"Вы можете остановить задачу через /tasks.",
+                    f"❌ Старый: `{account.phone}`\n"
+                    f"✅ Новый: `{new_acc.phone}`\n\n"
+                    f"Рассылка продолжается автоматически.",
                     parse_mode="Markdown",
                 )
             except Exception:
                 pass
         else:
-            # Ни один системный аккаунт не может писать в чат
             await remove_chat_from_task(db, task, account, chat_id)
             await db.commit()
-            log.warning("Чат %s удалён из задачи %d — нет доступных аккаунтов", chat_id, task_id)
             try:
                 await bot.send_message(
                     task.user_id,
                     f"⚠️ *Чат недоступен для рассылки*\n\n"
                     f"Задача: *{task.name}*\n"
                     f"Чат: {chat_title}\n"
-                    f"Аккаунт: `{account.phone}`\n\n"
                     f"Причина: {reason_text}\n\n"
-                    f"Ни один системный аккаунт не может писать в этот чат.\n"
-                    f"💡 Добавьте личный аккаунт через /accounts и пересоздайте задачу.",
+                    f"Ни один системный аккаунт не может писать в этот чат.",
                     parse_mode="Markdown",
                 )
             except Exception:
                 pass
     else:
-        # Пользовательский аккаунт — останавливаем задачу (не удаляем),
-        # отправляем уведомление с цитатой сообщения и кнопкой переноса.
         task.is_active = False
         await db.commit()
 
         if account.owner_id:
+            import html
             from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-            # Текст сообщения рассылки — показываем expandable blockquote
-            # В Telegram это достигается через HTML: <blockquote expandable>
             msg_preview = (task.message or "").strip()
             if len(msg_preview) > 800:
                 msg_preview = msg_preview[:800] + "…"
 
-            transfer_data = f"tasks:transfer_start:{task.id}:{chat_id}"
-
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(
                     text="🔄 Перенести рассылку на другой аккаунт",
-                    callback_data=transfer_data,
+                    callback_data=f"tasks:transfer_start:{task.id}:{chat_id}",
                 )],
-                [InlineKeyboardButton(
-                    text="◀️ Меню",
-                    callback_data="menu:new",
-                )],
+                [InlineKeyboardButton(text="◀️ Меню", callback_data="menu:new")],
             ])
-
-            # Экранируем текст для HTML
-            import html
-            msg_html = html.escape(msg_preview)
 
             try:
                 await bot.send_message(
@@ -706,9 +614,8 @@ async def handle_chat_restriction(
                     f"Задача: <b>{html.escape(task.name)}</b>\n\n"
                     f"Причина: {html.escape(reason_text)}\n\n"
                     f"<b>Текст рассылки:</b>\n"
-                    f"<blockquote expandable>{msg_html}</blockquote>\n\n"
-                    f"Нажмите кнопку ниже чтобы продолжить рассылку\n"
-                    f"через другой аккаунт.",
+                    f"<blockquote expandable>{html.escape(msg_preview)}</blockquote>\n\n"
+                    f"Нажмите кнопку ниже чтобы продолжить рассылку через другой аккаунт.",
                     reply_markup=kb,
                     parse_mode="HTML",
                 )
@@ -717,7 +624,7 @@ async def handle_chat_restriction(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ПРОВЕРКА ПРИ ОШИБКЕ ОТПРАВКИ (вызывается из worker.py)
+# ПРОВЕРКА ПРИ ОШИБКЕ ОТПРАВКИ
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def check_account_on_send_error(
@@ -726,12 +633,9 @@ async def check_account_on_send_error(
     chat_id: str,
     send_error: Exception,
 ):
-    """
-    Полный цикл проверки аккаунта при ошибке отправки.
-    Открывает собственную сессию БД чтобы не конфликтовать с воркером.
+    # Нормализуем сразу
+    chat_id = _normalize_chat_id(chat_id)
 
-    Используется кулдаун _SPAMCHECK_COOLDOWN — не проверяем чаще раза в 30 минут.
-    """
     now = time.monotonic()
     last = _last_spamcheck.get(account_id, 0)
     if now - last < _SPAMCHECK_COOLDOWN:
@@ -758,17 +662,14 @@ async def check_account_on_send_error(
                     await handle_frozen_account(db, account, bot)
                     return
 
-                # ── Шаг 1: Заморозка ─────────────────────────────────────────
                 if await is_account_frozen(client):
                     await handle_frozen_account(db, account, bot)
                     return
 
-                # ── Шаг 2: Спамблок ──────────────────────────────────────────
                 if await is_account_spamblocked(client):
                     await handle_spamblocked_account(db, account, bot)
                     return
 
-                # ── Шаг 3: Значит проблема в конкретном чате ─────────────────
                 err_name = type(send_error).__name__.lower()
                 err_str = str(send_error).lower()
 
@@ -799,14 +700,6 @@ async def check_account_on_send_error(
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def run_full_restriction_check():
-    """
-    Полная проверка всех активных аккаунтов:
-      1. Заморозка (get_me)
-      2. Спамблок (@SpamBot + spamblockcheck)
-      3. Доступ к чатам активных задач (лёгкая проверка без test-send)
-
-    Вызывается из воркера каждые 30 минут.
-    """
     from database import SessionLocal
 
     log.info("▶️  Запуск периодической проверки ограничений аккаунтов")
@@ -826,7 +719,7 @@ async def run_full_restriction_check():
 
             for account in accounts:
                 await _check_single_account(db, account, bot)
-                await asyncio.sleep(3)  # пауза между аккаунтами
+                await asyncio.sleep(3)
 
     except Exception as e:
         log.error("Критическая ошибка проверки ограничений: %s", e)
@@ -836,7 +729,6 @@ async def run_full_restriction_check():
 
 
 async def _check_single_account(db: AsyncSession, account: Account, bot: Bot):
-    """Проверить один аккаунт на все виды ограничений."""
     client = make_client(account)
     try:
         await client.connect()
@@ -846,20 +738,16 @@ async def _check_single_account(db: AsyncSession, account: Account, bot: Bot):
             await handle_frozen_account(db, account, bot)
             return
 
-        # ── 1. Заморозка ──────────────────────────────────────────────────────
         if await is_account_frozen(client):
             await handle_frozen_account(db, account, bot)
             return
 
-        # ── 2. Спамблок ───────────────────────────────────────────────────────
-        # Обновляем кулдаун так как это плановая проверка
         _last_spamcheck[account.id] = time.monotonic()
 
         if await is_account_spamblocked(client):
             await handle_spamblocked_account(db, account, bot)
             return
 
-        # ── 3. Доступ к чатам ─────────────────────────────────────────────────
         await _check_account_chat_access(db, account, client, bot)
 
     except Exception as e:
@@ -877,17 +765,12 @@ async def _check_account_chat_access(
     client: TelegramClient,
     bot: Bot,
 ):
-    """
-    Проверить лёгким методом доступ аккаунта ко всем чатам активных задач.
-    При обнаружении проблемы вызывает handle_chat_restriction.
-    """
     result = await db.execute(
         select(TaskAccount).where(TaskAccount.account_id == account.id)
     )
     task_accounts = result.scalars().all()
 
     for ta in task_accounts:
-        # Проверяем что задача активна
         result = await db.execute(
             select(Task).where(Task.id == ta.task_id, Task.is_active == True)
         )
@@ -896,12 +779,15 @@ async def _check_account_chat_access(
             continue
 
         try:
-            chat_ids = json.loads(ta.chat_ids or "[]")
+            raw_chat_ids = json.loads(ta.chat_ids or "[]")
         except Exception:
             continue
 
-        for chat_id in list(chat_ids):  # list() — копия, т.к. может меняться
-            can_write, reason = await check_chat_access_light(client, str(chat_id))
+        # Нормализуем все chat_id из БД перед проверкой
+        chat_ids = [_normalize_chat_id(str(cid)) for cid in raw_chat_ids]
+
+        for chat_id in list(chat_ids):
+            can_write, reason = await check_chat_access_light(client, chat_id)
 
             if not can_write:
                 log.warning(
@@ -909,7 +795,7 @@ async def _check_account_chat_access(
                     account.phone, chat_id, reason,
                 )
                 await handle_chat_restriction(
-                    db, account, ta.task_id, str(chat_id), reason, bot
+                    db, account, ta.task_id, chat_id, reason, bot
                 )
 
-            await asyncio.sleep(1)  # пауза между чатами
+            await asyncio.sleep(1)
