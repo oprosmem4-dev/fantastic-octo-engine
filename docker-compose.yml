@@ -22,19 +22,20 @@ services:
     ports:
       - "6379:6379"
 
-  # ── Главный бот ─────────────────────────────────────────────────────────────
-  bot:
+  # ── Бот-регистратор зеркал (главная точка входа для пользователей) ──────────
+  # Пользователи приходят сюда, регистрируют свой токен → получают зеркало
+  generator:
     build: .
     restart: unless-stopped
-    command: python bot/main_bot.py
+    command: python bot/generator_bot.py
     env_file: .env
     depends_on:
       - postgres
       - redis
-    volumes:
-      - sessions:/app/sessions   # Telethon session-файлы
 
-  # ── Зеркальные боты ─────────────────────────────────────────────────────────
+  # ── Mirror runner — запускает все зеркала из БД ─────────────────────────────
+  # Один инстанс держит до ~500 зеркал на asyncio.
+  # Для масштабирования запустите несколько инстансов с MIRROR_SHARD_MIN/MAX.
   mirrors:
     build: .
     restart: unless-stopped
@@ -45,8 +46,13 @@ services:
       - redis
     volumes:
       - sessions:/app/sessions
+    # Для масштабирования добавьте ещё один сервис mirrors_2 с другим шардом:
+    # environment:
+    #   - MIRROR_SHARD_MIN=500000
+    #   - MIRROR_SHARD_MAX=1000000
 
   # ── Воркер рассылок ──────────────────────────────────────────────────────────
+  # Один воркер обслуживает ВСЕ зеркала — задачи хранятся в общей БД.
   worker:
     build: .
     restart: unless-stopped
@@ -58,7 +64,7 @@ services:
     volumes:
       - sessions:/app/sessions
 
-  # ── FastAPI ──────────────────────────────────────────────────────────────────
+  # ── FastAPI (CryptoBot webhook) ───────────────────────────────────────────────
   api:
     build: .
     restart: unless-stopped
