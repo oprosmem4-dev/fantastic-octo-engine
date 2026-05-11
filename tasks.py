@@ -2,9 +2,13 @@
 bot/handlers/tasks.py — создание и управление задачами рассылок.
 
 ИСПРАВЛЕНИЯ:
+  - Везде используется parse_mode="HTML" вместо Markdown
+  - Пользовательские данные (названия чатов, имена задач) экранируются через html.escape()
+  - Это исключает ошибку "Can't find end of the entity" при символах _ * ` [ в названиях чатов
   - got_task_chats: chat_id при ручном вводе всегда нормализуется (убираем @@)
   - _normalize_chat_id: вспомогательная функция для единообразия
 """
+import html
 import logging
 import json
 from aiogram import Router, F
@@ -46,9 +50,9 @@ async def cb_cancel_to_menu(query: CallbackQuery, state: FSMContext, user: User)
         await state.clear()
     from bot.keyboards import kb_main_menu
     await query.message.edit_text(
-        f"👋 Главное меню\n{user.subscription_status}",
+        f"👋 Главное меню\n{html.escape(user.subscription_status)}",
         reply_markup=kb_main_menu(user.has_access),
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
 
 
@@ -69,18 +73,20 @@ def _normalize_chat_id(raw: str) -> str:
 
 
 def _chat_display(title: str, username: str | None, link: str | None) -> str:
+    """Форматирование чата для HTML."""
     url = f"https://t.me/{username}" if username else link
     if url:
-        return f"[{title}]({url})"
-    return title
+        return f'<a href="{url}">{html.escape(title)}</a>'
+    return html.escape(title)
 
 
 def _chat_display_from_task_chat(c) -> str:
+    """Форматирование TaskChat для HTML."""
     ct = c.chat_title or ""
     if ct.startswith("@"):
         uname = ct.lstrip("@")
-        return f"[{ct}](https://t.me/{uname})"
-    return ct or c.chat_id
+        return f'<a href="https://t.me/{uname}">{html.escape(ct)}</a>'
+    return html.escape(ct) if ct else html.escape(c.chat_id)
 
 
 # ── Список задач ──────────────────────────────────────────────────────────────
@@ -89,16 +95,16 @@ def _chat_display_from_task_chat(c) -> str:
 async def cmd_tasks(message: Message, state: FSMContext, user: User, db: AsyncSession):
     await state.clear()
     tasks = await task_service.get_tasks(db, user.id)
-    text = "📋 *Ваши задачи*" if tasks else "📋 У вас пока нет задач."
-    await message.answer(text, reply_markup=kb_tasks(tasks), parse_mode="Markdown")
+    text = "📋 <b>Ваши задачи</b>" if tasks else "📋 У вас пока нет задач."
+    await message.answer(text, reply_markup=kb_tasks(tasks), parse_mode="HTML")
 
 
 @router.callback_query(F.data == "tasks:list")
 async def cb_tasks_list(query: CallbackQuery, state: FSMContext, user: User, db: AsyncSession):
     await state.clear()
     tasks = await task_service.get_tasks(db, user.id)
-    text = "📋 *Ваши задачи*" if tasks else "📋 У вас пока нет задач."
-    await query.message.edit_text(text, reply_markup=kb_tasks(tasks), parse_mode="Markdown")
+    text = "📋 <b>Ваши задачи</b>" if tasks else "📋 У вас пока нет задач."
+    await query.message.edit_text(text, reply_markup=kb_tasks(tasks), parse_mode="HTML")
 
 
 @router.callback_query(F.data.startswith("tasks:view:"))
@@ -131,24 +137,24 @@ async def view_task(query: CallbackQuery, state: FSMContext, user: User, db: Asy
         acc_name = acc.phone if acc else f"acc#{link.account_id}"
         if acc and acc.is_system:
             acc_name += " (system)"
-        acc_lines.append(f"• {acc_name}: {len(ids)} чатов")
+        acc_lines.append(f"• {html.escape(acc_name)}: {len(ids)} чатов")
 
     accounts_block = "\n".join(acc_lines) if acc_lines else "—"
 
     text = (
-        f"{icon} *{task.name}*\n\n"
-        f"💬 Сообщение:\n_{task.message[:200]}_\n\n"
+        f"{icon} <b>{html.escape(task.name)}</b>\n\n"
+        f"💬 Сообщение:\n<i>{html.escape(task.message[:200])}</i>\n\n"
         f"⏱ Интервал: каждые {task.interval_minutes} мин.\n"
         f"📬 Чатов: {len(task.chats)}\n"
         f"🤖 Аккаунтов: {len(task.accounts)}\n\n"
-        f"🏷 *Чаты рассылки:*\n{chats_block}\n\n"
-        f"👤 *Распределение:*\n{accounts_block}"
+        f"🏷 <b>Чаты рассылки:</b>\n{chats_block}\n\n"
+        f"👤 <b>Распределение:</b>\n{accounts_block}"
     )
 
     await query.message.edit_text(
         text,
         reply_markup=kb_task_detail(task),
-        parse_mode="Markdown",
+        parse_mode="HTML",
         disable_web_page_preview=True,
     )
 
@@ -170,13 +176,13 @@ async def toggle_task(query: CallbackQuery, state: FSMContext, user: User, db: A
     if task:
         icon = "▶️" if task.is_active else "⏸"
         text = (
-            f"{icon} *{task.name}*\n\n"
-            f"💬 Сообщение:\n_{task.message[:200]}_\n\n"
+            f"{icon} <b>{html.escape(task.name)}</b>\n\n"
+            f"💬 Сообщение:\n<i>{html.escape(task.message[:200])}</i>\n\n"
             f"⏱ Интервал: каждые {task.interval_minutes} мин.\n"
             f"📬 Чатов: {len(task.chats)}"
         )
         await query.message.edit_text(
-            text, reply_markup=kb_task_detail(task), parse_mode="Markdown"
+            text, reply_markup=kb_task_detail(task), parse_mode="HTML"
         )
 
 
@@ -189,9 +195,9 @@ async def ask_delete_task(query: CallbackQuery, state: FSMContext, user: User, d
         await query.answer("Задача не найдена.", show_alert=True)
         return
     await query.message.edit_text(
-        f"⚠️ Удалить задачу *{task.name}*?\n\nЭто действие нельзя отменить.",
+        f"⚠️ Удалить задачу <b>{html.escape(task.name)}</b>?\n\nЭто действие нельзя отменить.",
         reply_markup=kb_task_delete_confirm(task_id),
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
 
 
@@ -202,8 +208,8 @@ async def confirm_delete_task(query: CallbackQuery, state: FSMContext, user: Use
     deleted = await task_service.delete_task(db, task_id, user.id)
     await query.answer("✅ Задача удалена." if deleted else "❌ Не найдено.", show_alert=not deleted)
     tasks = await task_service.get_tasks(db, user.id)
-    text  = "📋 *Ваши задачи*" if tasks else "📋 У вас пока нет задач."
-    await query.message.edit_text(text, reply_markup=kb_tasks(tasks), parse_mode="Markdown")
+    text  = "📋 <b>Ваши задачи</b>" if tasks else "📋 У вас пока нет задач."
+    await query.message.edit_text(text, reply_markup=kb_tasks(tasks), parse_mode="HTML")
 
 
 # ── Создание задачи (FSM) ─────────────────────────────────────────────────────
@@ -215,11 +221,11 @@ async def cb_new_task(query: CallbackQuery, state: FSMContext, user: User):
         await query.answer("⚠️ Нужна активная подписка.", show_alert=True)
         return
     await query.message.edit_text(
-        "➕ *Новая задача рассылки*\n\n"
-        "*Шаг 1/4* — Введите название задачи:\n"
-        "Например: `Реклама магазина`",
+        "➕ <b>Новая задача рассылки</b>\n\n"
+        "<b>Шаг 1/4</b> — Введите название задачи:\n"
+        "Например: <code>Реклама магазина</code>",
         reply_markup=kb_cancel(),
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
     await state.set_state(CreateTask.name)
 
@@ -231,10 +237,10 @@ async def cmd_new_task(message: Message, state: FSMContext, user: User):
         await message.answer("⚠️ Нужна активная подписка.")
         return
     await message.answer(
-        "➕ *Новая задача рассылки*\n\n"
-        "*Шаг 1/4* — Введите название задачи:",
+        "➕ <b>Новая задача рассылки</b>\n\n"
+        "<b>Шаг 1/4</b> — Введите название задачи:",
         reply_markup=kb_cancel(),
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
     await state.set_state(CreateTask.name)
 
@@ -243,9 +249,9 @@ async def cmd_new_task(message: Message, state: FSMContext, user: User):
 async def got_task_name(message: Message, state: FSMContext):
     await state.update_data(name=message.text.strip())
     await message.answer(
-        "*Шаг 2/4* — Введите текст сообщения для рассылки:",
+        "<b>Шаг 2/4</b> — Введите текст сообщения для рассылки:",
         reply_markup=kb_cancel(),
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
     await state.set_state(CreateTask.message)
 
@@ -299,12 +305,12 @@ async def got_task_message(message: Message, state: FSMContext):
         photo_file_ids=photo_file_ids,
     )
     await message.answer(
-        "*Шаг 3/4* — Введите интервал в минутах:\n\n"
-        "Минимум: *1 минут*\n"
+        "<b>Шаг 3/4</b> — Введите интервал в минутах:\n\n"
+        "Минимум: <b>1 минута</b>\n"
         "⚠️ РЕКОМЕНДУЕМ ОТ 5 ДО 15 минут\n"
-        "Пример: `60` = каждый час",
+        "Пример: <code>60</code> = каждый час",
         reply_markup=kb_cancel(),
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
     await state.set_state(CreateTask.interval)
 
@@ -313,16 +319,16 @@ async def got_task_message(message: Message, state: FSMContext):
 async def got_task_interval(message: Message, state: FSMContext):
     text = message.text.strip()
     if not text.isdigit() or int(text) < 1:
-        await message.answer("❌ Минимум 1 минут. Введите число ≥ 1:")
+        await message.answer("❌ Минимум 1 минута. Введите число ≥ 1:")
         return
     await state.update_data(interval=int(text))
     await message.answer(
-        "*Шаг 4/4* — Введите чаты:\n\n"
-        "Вариант 1 — ссылка на папку:\n`https://t.me/addlist/XXXX`\n\n"
+        "<b>Шаг 4/4</b> — Введите чаты:\n\n"
+        "Вариант 1 — ссылка на папку:\n<code>https://t.me/addlist/XXXX</code>\n\n"
         "Вариант 2 — список через новую строку:\n"
-        "`@username`\n`-1001234567890`",
+        "<code>@username</code>\n<code>-1001234567890</code>",
         reply_markup=kb_cancel(),
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
     await state.set_state(CreateTask.chats)
 
@@ -354,8 +360,8 @@ async def got_task_chats(message: Message, state: FSMContext, user: User, db: As
         except Exception as e:
             log.error("Ошибка получения папки: %s", e)
             await message.answer(
-                f"❌ Не удалось получить чаты из папки.\n`{e}`\n\nПопробуйте ввести вручную:",
-                parse_mode="Markdown",
+                f"❌ Не удалось получить чаты из папки.\n<code>{html.escape(str(e))}</code>\n\nПопробуйте ввести вручную:",
+                parse_mode="HTML",
             )
             return
         finally:
@@ -367,9 +373,9 @@ async def got_task_chats(message: Message, state: FSMContext, user: User, db: As
         if not chats:
             await message.answer(
                 "❌ Папка пустая или недоступна.\n\n"
-                "Убедитесь что ссылка вида `https://t.me/addlist/XXXX`\n\n"
+                "Убедитесь что ссылка вида <code>https://t.me/addlist/XXXX</code>\n\n"
                 "Попробуйте ввести чаты вручную:",
-                parse_mode="Markdown",
+                parse_mode="HTML",
             )
             return
 
@@ -382,13 +388,12 @@ async def got_task_chats(message: Message, state: FSMContext, user: User, db: As
 
             # Нормализуем сразу при вводе — убираем лишние @
             if line.startswith("@"):
-                username = line.lstrip("@")   # убираем все @
-                chat_id  = f"@{username}"      # ровно один @
+                username = line.lstrip("@")
+                chat_id  = f"@{username}"
             elif line.lstrip("-").isdigit():
                 username = None
                 chat_id  = line
             else:
-                # просто слово без @ — трактуем как username
                 username = line.lstrip("@")
                 chat_id  = f"@{username}"
 
@@ -409,12 +414,12 @@ async def got_task_chats(message: Message, state: FSMContext, user: User, db: As
 
     await state.update_data(chats=chats)
 
-    # Превью
+    # Превью — экранируем все названия через html.escape()
     preview_lines = []
     for c in chats[:10]:
         uname = c.get("username")
         title = c.get("title") or (f"@{uname}" if uname else c["id"])
-        preview_lines.append(f"• {title}")
+        preview_lines.append(f"• {html.escape(title)}")
     preview = "\n".join(preview_lines)
     if len(chats) > 10:
         preview += f"\n...и ещё {len(chats) - 10}"
@@ -422,11 +427,11 @@ async def got_task_chats(message: Message, state: FSMContext, user: User, db: As
     accounts = await account_service.get_accounts(db, owner_id=user.id)
 
     await message.answer(
-        f"✅ Найдено чатов: *{len(chats)}*\n\n"
+        f"✅ Найдено чатов: <b>{len(chats)}</b>\n\n"
         f"{preview}\n\n"
-        f"*Шаг 5/5* — Выберите отправителя:",
+        f"<b>Шаг 5/5</b> — Выберите отправителя:",
         reply_markup=kb_choose_sender(accounts),
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
     await state.set_state(CreateTask.sender)
 
@@ -448,13 +453,13 @@ async def got_sender_choice(query: CallbackQuery, state: FSMContext, user: User,
     chats = data.get("chats", [])
 
     await query.message.edit_text(
-        f"✅ Отправитель: *{sender_text}*\n\n"
-        f"📋 Задача: *{data['name']}*\n"
-        f"📬 Чатов: *{len(chats)}*\n"
+        f"✅ Отправитель: <b>{html.escape(sender_text)}</b>\n\n"
+        f"📋 Задача: <b>{html.escape(data['name'])}</b>\n"
+        f"📬 Чатов: <b>{len(chats)}</b>\n"
         f"⏱ Каждые {data['interval']} мин.\n\n"
-        f"Нажмите *Продолжить* для создания задачи:",
+        f"Нажмите <b>Продолжить</b> для создания задачи:",
         reply_markup=kb_confirm_chats(),
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
 
 
@@ -526,19 +531,19 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
         title = r.get("title") or (f"@{uname}" if uname else "—")
         link  = f"https://t.me/{uname}" if uname else r.get("link")
         if link:
-            return f"[{title}]({link})"
-        return title
+            return f'<a href="{link}">{html.escape(title)}</a>'
+        return html.escape(title)
 
     if not accessible:
         await state.clear()
         lines = []
         for r in inaccessible[:20]:
-            lines.append(f"• {_fmt_chat(r)} — {_reason_label(r['reason'])}")
+            lines.append(f"• {_fmt_chat(r)} — {html.escape(_reason_label(r['reason']))}")
         await query.message.edit_text(
-            f"❌ *Аккаунт не может писать ни в один чат.*\n\n"
+            f"❌ <b>Аккаунт не может писать ни в один чат.</b>\n\n"
             + "\n".join(lines),
             reply_markup=kb_access_error(),
-            parse_mode="Markdown",
+            parse_mode="HTML",
             disable_web_page_preview=True,
         )
         return
@@ -571,18 +576,18 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
     if inaccessible:
         lines = []
         for r in inaccessible[:20]:
-            lines.append(f"• {_fmt_chat(r)} — {_reason_label(r['reason'])}")
+            lines.append(f"• {_fmt_chat(r)} — {html.escape(_reason_label(r['reason']))}")
         if len(inaccessible) > 20:
             lines.append(f"…и ещё {len(inaccessible) - 20}")
         await query.message.edit_text(
-            f"⚠️ *Задача создана частично*\n\n"
-            f"✅ Доступно: *{len(accessible)}* из *{len(results)}*\n\n"
+            f"⚠️ <b>Задача создана частично</b>\n\n"
+            f"✅ Доступно: <b>{len(accessible)}</b> из <b>{len(results)}</b>\n\n"
             f"❌ Недоступные:\n" + "\n".join(lines) + "\n\n"
-            f"📋 {task['name']}\n"
+            f"📋 {html.escape(task['name'])}\n"
             f"📬 Чатов: {task['chats_count']}\n"
             f"⏱ Каждые {task['interval_minutes']} мин.",
             reply_markup=kb_back_to_menu(),
-            parse_mode="Markdown",
+            parse_mode="HTML",
             disable_web_page_preview=True,
         )
         return
@@ -592,13 +597,13 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
         preview_lines.append(f"…и ещё {len(accessible) - 10}")
 
     await query.message.edit_text(
-        f"✅ *Задача создана!*\n\n"
-        f"📋 {task['name']}\n"
+        f"✅ <b>Задача создана!</b>\n\n"
+        f"📋 {html.escape(task['name'])}\n"
         f"📬 Чатов: {task['chats_count']}\n"
         f"⏱ Каждые {task['interval_minutes']} мин.\n\n"
-        f"🏷 *Чаты рассылки:*\n" + "\n".join(preview_lines),
+        f"🏷 <b>Чаты рассылки:</b>\n" + "\n".join(preview_lines),
         reply_markup=kb_back_to_menu(),
-        parse_mode="Markdown",
+        parse_mode="HTML",
         disable_web_page_preview=True,
     )
     log.info("Создана задача %d для user %d", task["id"], user.id)
