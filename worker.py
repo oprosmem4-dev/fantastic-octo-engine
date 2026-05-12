@@ -1,15 +1,23 @@
 """
 worker/worker.py — воркер рассылок.
 
-ИСПРАВЛЕНИЯ:
-  - resolve_entity: убрана обработка @@ (двойной @), нормализация chat_id
-  - resolve_entity: @username теперь всегда стрипается до одного @
+ИЗМЕНЕНИЯ:
+  - Планировщик переработан: вместо job-per-task → job-per-chat
+    Каждая пара (task_id, account_id, chat_id) получает свой независимый job.
+    Следующий запуск = last_sent_at + interval_minutes + random_offset_seconds.
+    Random offset генерируется индивидуально для каждого чата при каждой отправке.
+  - get_dialogs() убран из цикла отправки (лишняя активность).
+  - Невидимая рандомизация текста: zero-width space вставляется в случайную
+    позицию — визуально текст не меняется, хэш сообщения разный.
+  - _ChatSendState хранит last_sent_at в памяти между итерациями.
 """
 import asyncio
 import io
 import json
 import logging
-from datetime import datetime, timezone
+import random
+from datetime import datetime, timezone, timedelta
+
 from sqlalchemy.orm import selectinload
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import select
@@ -17,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from telethon.errors import FloodWaitError, UserBannedInChannelError, ChatWriteForbiddenError
 from telethon.tl import types as tl_types
 from aiogram import Bot
+
 from config import BOT_TOKEN
 from database import SessionLocal, create_all_tables
 from models import Task, TaskAccount, Account, Log
@@ -26,8 +35,32 @@ from services.restriction_service import check_account_on_send_error
 log = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler(timezone="UTC")
-_loaded_tasks: dict[int, int] = {}
+
+# job_id → interval_minutes (для отслеживания изменений интервала)
+_loaded_jobs: dict[str, int] = {}
+
+# (task_id, account_id, chat_id) → last_sent_at (datetime UTC)
+# Хранится в памяти, сбрасывается при рестарте воркера.
+_last_sent: dict[tuple, datetime] = {}
+
 _restriction_check_running = False
+
+# ── Невидимая рандомизация текста ────────────────────────────────────────────
+# Zero-width символы — визуально не отображаются ни в одном клиенте Telegram.
+_ZW_CHARS = ['\u200b', '\u200c', '\u200d']
+
+
+def _randomize_text(text: str) -> str:
+    """
+    Вставляет один zero-width символ в случайную позицию текста.
+    Визуально текст не изменяется, хэш сообщения — уникальный.
+    Если текст пустой — возвращает как есть.
+    """
+    if not text:
+        return text
+    pos = random.randint(0, len(text))
+    char = random.choice(_ZW_CHARS)
+    return text[:pos] + char + text[pos:]
 
 
 # ── Загрузка фото через Bot API ───────────────────────────────────────────────
@@ -55,92 +88,124 @@ async def download_photos(file_ids: list[str]) -> list[io.BytesIO]:
     return results
 
 
-# ── Главный цикл ──────────────────────────────────────────────────────────────
+# ── Синхронизация планировщика с БД ──────────────────────────────────────────
 
 async def sync_tasks():
+    """
+    Каждые 30 сек читает активные задачи из БД и синхронизирует APScheduler.
+    Единица планирования — (task_id, account_id, chat_id).
+    Job ID формат: "chat_{task_id}_{account_id}_{safe_chat_id}"
+    """
     async with SessionLocal() as db:
         result = await db.execute(
-            select(Task).where(Task.is_active == True)
+            select(Task)
+            .options(selectinload(Task.accounts))
+            .where(Task.is_active == True)
         )
         active_tasks = result.scalars().all()
-        active_ids = {t.id for t in active_tasks}
 
-        for task_id in list(_loaded_tasks.keys()):
-            if task_id not in active_ids:
-                job_id = f"task_{task_id}"
-                if scheduler.get_job(job_id):
-                    scheduler.remove_job(job_id)
-                del _loaded_tasks[task_id]
-                log.info("Удалена задача %d из планировщика", task_id)
+        # Собираем все job_id которые должны существовать
+        desired_jobs: dict[str, tuple] = {}  # job_id → (task_id, account_id, chat_id, interval)
 
         for task in active_tasks:
-            job_id = f"task_{task.id}"
-            existing_interval = _loaded_tasks.get(task.id)
+            # Проверяем доступ пользователя
+            result2 = await db.execute(
+                select(Task).options(selectinload(Task.user)).where(Task.id == task.id)
+            )
+            full_task = result2.scalar_one_or_none()
+            if not full_task or not full_task.user.has_access:
+                continue
+
+            for ta in task.accounts:
+                try:
+                    chat_ids = json.loads(ta.chat_ids or "[]")
+                except Exception:
+                    chat_ids = []
+
+                for chat_id in chat_ids:
+                    safe = chat_id.replace("@", "at_").replace("-", "m_")
+                    job_id = f"chat_{task.id}_{ta.account_id}_{safe}"
+                    desired_jobs[job_id] = (task.id, ta.account_id, chat_id, task.interval_minutes)
+
+        # Удаляем лишние jobs
+        for job_id in list(_loaded_jobs.keys()):
+            if job_id not in desired_jobs:
+                if scheduler.get_job(job_id):
+                    scheduler.remove_job(job_id)
+                del _loaded_jobs[job_id]
+                log.info("Удалён job %s", job_id)
+
+        # Добавляем новые / обновляем изменившиеся интервалы
+        for job_id, (task_id, account_id, chat_id, interval) in desired_jobs.items():
+            existing_interval = _loaded_jobs.get(job_id)
 
             if existing_interval is None:
+                # Новый job — первый запуск немедленно, потом по интервалу
                 scheduler.add_job(
-                    run_task,
+                    send_chat_job,
                     "interval",
-                    minutes=task.interval_minutes,
+                    minutes=interval,
                     id=job_id,
-                    args=[task.id],
+                    args=[task_id, account_id, chat_id],
                     next_run_time=datetime.now(timezone.utc),
                     replace_existing=True,
                 )
-                _loaded_tasks[task.id] = task.interval_minutes
-                log.info("Добавлена задача %d (каждые %d мин.)", task.id, task.interval_minutes)
+                _loaded_jobs[job_id] = interval
+                log.info(
+                    "Добавлен job %s (task=%d acc=%d chat=%s каждые %d мин.)",
+                    job_id, task_id, account_id, chat_id, interval
+                )
 
-            elif existing_interval != task.interval_minutes:
-                scheduler.reschedule_job(job_id, trigger="interval", minutes=task.interval_minutes)
-                _loaded_tasks[task.id] = task.interval_minutes
-                log.info("Обновлён интервал задачи %d → %d мин.", task.id, task.interval_minutes)
-
-
-async def check_restrictions():
-    global _restriction_check_running
-    if _restriction_check_running:
-        log.debug("Проверка ограничений уже запущена, пропускаем")
-        return
-
-    _restriction_check_running = True
-    try:
-        from services.restriction_service import run_full_restriction_check
-        await run_full_restriction_check()
-    except Exception as e:
-        log.error("Ошибка в check_restrictions: %s", e)
-    finally:
-        _restriction_check_running = False
+            elif existing_interval != interval:
+                scheduler.reschedule_job(
+                    job_id, trigger="interval", minutes=interval
+                )
+                _loaded_jobs[job_id] = interval
+                log.info("Обновлён интервал job %s → %d мин.", job_id, interval)
 
 
-# ── Выполнение одной задачи ───────────────────────────────────────────────────
+# ── Job для одного чата ───────────────────────────────────────────────────────
 
-async def run_task(task_id: int):
+async def send_chat_job(task_id: int, account_id: int, chat_id: str):
+    """
+    Вызывается APScheduler для конкретной пары (task, account, chat).
+
+    Логика времени:
+      - Смотрим когда последний раз отправляли в ЭТОТ чат (_last_sent).
+      - Если прошло меньше чем interval - random_offset → пропускаем.
+        (APScheduler может немного опередить из-за точности планировщика)
+      - После успешной отправки записываем время и планируем следующий
+        запуск с новым random_offset секунд поверх интервала.
+
+    Random offset: 0..120 секунд, генерируется заново каждый раз.
+    """
+    key = (task_id, account_id, chat_id)
+    now = datetime.now(timezone.utc)
+
     async with SessionLocal() as db:
+        # Загружаем задачу
         result = await db.execute(
             select(Task)
             .options(selectinload(Task.user))
             .where(Task.id == task_id)
         )
         task = result.scalar_one_or_none()
-
         if not task or not task.is_active:
             return
-
         if not task.user.has_access:
-            log.info("Задача %d: пользователь %d без доступа, пропускаем", task_id, task.user_id)
+            log.info("task=%d: пользователь без доступа, пропуск", task_id)
             return
 
-        log.info("Запускаю задачу %d (%s)", task_id, task.name)
-
+        # Загружаем аккаунт
         result = await db.execute(
-            select(TaskAccount).where(TaskAccount.task_id == task_id)
+            select(Account).where(Account.id == account_id)
         )
-        task_accounts = result.scalars().all()
-
-        if not task_accounts:
-            log.warning("Задача %d: нет аккаунтов", task_id)
+        account = result.scalar_one_or_none()
+        if not account or not account.is_active or account.is_banned or account.status != "ok":
+            log.warning("Аккаунт %d недоступен, пропуск chat=%s", account_id, chat_id)
             return
 
+        # Подготовка данных сообщения
         message_text = task.message or ""
         try:
             photo_file_ids = json.loads(task.photo_file_ids or "[]")
@@ -154,76 +219,65 @@ async def run_task(task_id: int):
         photo_bytes: list[io.BytesIO] = []
         if photo_file_ids:
             photo_bytes = await download_photos(photo_file_ids)
-            if not photo_bytes:
-                log.warning("Задача %d: не удалось скачать фото, отправим без них", task_id)
 
-        for ta in task_accounts:
-            await send_via_account(
-                db, ta, task,
+        client = make_client(account)
+        try:
+            await client.connect()
+            await asyncio.sleep(1)
+
+            if not await client.is_user_authorized():
+                log.warning("Аккаунт %s не авторизован", account.phone)
+                return
+
+            # get_dialogs() убран — лишняя активность
+
+            success = await send_to_chat(
+                db, client, account, task_id, chat_id,
                 message_text=message_text,
                 photo_bytes=photo_bytes,
                 entities_json=format_entities_json,
             )
 
-        task.last_run_at = datetime.now(timezone.utc)
-        await db.commit()
+        except Exception as e:
+            log.error("Ошибка аккаунта %s при отправке в %s: %s", account.phone, chat_id, e)
+            success = False
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 
+    if success:
+        _last_sent[key] = datetime.now(timezone.utc)
 
-async def send_via_account(
-    db: AsyncSession,
-    ta: TaskAccount,
-    task: Task,
-    message_text: str,
-    photo_bytes: list[io.BytesIO],
-    entities_json: list[dict],
-):
-    result = await db.execute(select(Account).where(Account.id == ta.account_id))
-    account = result.scalar_one_or_none()
-
-    if not account or not account.is_active or account.is_banned or account.status != "ok":
-        log.warning("Аккаунт %d недоступен (status=%s)", ta.account_id,
-                    getattr(account, "status", "?") if account else "not found")
-        return
-
-    try:
-        chat_ids: list[str] = json.loads(ta.chat_ids)
-    except Exception:
-        return
-
-    if not chat_ids:
-        return
-
-    client = make_client(account)
-    try:
-        await client.connect()
-        await asyncio.sleep(1)
-
-        if not await client.is_user_authorized():
-            log.warning("Аккаунт %s не авторизован", account.phone)
-            return
-
-        await client.get_dialogs()
-
-        for chat_id in chat_ids:
-            for buf in photo_bytes:
-                buf.seek(0)
-
-            await send_to_chat(
-                db, client, account, ta.task_id, chat_id,
-                message_text=message_text,
-                photo_bytes=photo_bytes,
-                entities_json=entities_json,
+        # Перепланируем job с новым random offset
+        random_offset_sec = random.randint(0, 120)
+        job_id = _make_job_id(task_id, account_id, chat_id)
+        job = scheduler.get_job(job_id)
+        if job:
+            interval_min = _loaded_jobs.get(job_id, task.interval_minutes)
+            next_run = datetime.now(timezone.utc) + timedelta(
+                minutes=interval_min,
+                seconds=random_offset_sec,
             )
-            await asyncio.sleep(2)
+            scheduler.reschedule_job(
+                job_id,
+                trigger="interval",
+                minutes=interval_min,
+                start_date=next_run,
+            )
+            log.info(
+                "✓ [%s] → %s | следующий через %d мин. + %d сек.",
+                account.phone, chat_id, interval_min, random_offset_sec
+            )
 
-    except Exception as e:
-        log.error("Ошибка аккаунта %s: %s", account.phone, e)
-    finally:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
 
+def _make_job_id(task_id: int, account_id: int, chat_id: str) -> str:
+    safe = chat_id.replace("@", "at_").replace("-", "m_")
+    return f"chat_{task_id}_{account_id}_{safe}"
+
+
+# ── Отправка в один чат ───────────────────────────────────────────────────────
 
 async def send_to_chat(
     db: AsyncSession,
@@ -234,9 +288,17 @@ async def send_to_chat(
     message_text: str,
     photo_bytes: list[io.BytesIO],
     entities_json: list[dict],
-):
+) -> bool:
+    """
+    Отправляет сообщение в один чат.
+    Текст рандомизируется (zero-width char) — визуально не меняется.
+    Возвращает True при успехе.
+    """
     success = False
     error_text = None
+
+    # Рандомизируем текст перед отправкой
+    send_text = _randomize_text(message_text)
 
     try:
         entity = await resolve_entity(client, chat_id)
@@ -246,43 +308,46 @@ async def send_to_chat(
         else:
             entities = _to_telethon_entities(entities_json)
             if photo_bytes:
+                for buf in photo_bytes:
+                    buf.seek(0)
                 files = photo_bytes if len(photo_bytes) > 1 else photo_bytes[0]
                 await client.send_file(
                     entity,
                     file=files,
-                    caption=message_text or "",
+                    caption=send_text or "",
                     formatting_entities=entities if entities else None,
                 )
             else:
                 await client.send_message(
                     entity,
-                    message_text or "",
+                    send_text or "",
                     formatting_entities=entities if entities else None,
                 )
             success = True
-            log.info("✓ [%s] → %s", account.phone, chat_id)
 
     except FloodWaitError as e:
-        log.warning("FloodWait %d сек. для %s", e.seconds, account.phone)
-        await asyncio.sleep(e.seconds)
-        for buf in photo_bytes:
-            buf.seek(0)
+        log.warning("FloodWait %d сек. для %s в %s", e.seconds, account.phone, chat_id)
+        await asyncio.sleep(min(e.seconds, 60))
+        # Повторная попытка после ожидания
         try:
             entity = await resolve_entity(client, chat_id)
             if entity:
+                for buf in photo_bytes:
+                    buf.seek(0)
                 entities = _to_telethon_entities(entities_json)
+                retry_text = _randomize_text(message_text)
                 if photo_bytes:
                     files = photo_bytes if len(photo_bytes) > 1 else photo_bytes[0]
                     await client.send_file(
                         entity,
                         file=files,
-                        caption=message_text or "",
+                        caption=retry_text or "",
                         formatting_entities=entities if entities else None,
                     )
                 else:
                     await client.send_message(
                         entity,
-                        message_text or "",
+                        retry_text or "",
                         formatting_entities=entities if entities else None,
                     )
                 success = True
@@ -298,7 +363,7 @@ async def send_to_chat(
 
     except Exception as e:
         error_text = str(e)
-        log.error("Ошибка отправки в %s: %s", chat_id, e)
+        log.error("Ошибка отправки в %s через %s: %s", chat_id, account.phone, e)
         asyncio.create_task(
             check_account_on_send_error(account.id, task_id, chat_id, e)
         )
@@ -312,6 +377,10 @@ async def send_to_chat(
     ))
     await db.commit()
 
+    return success
+
+
+# ── Вспомогательные функции ───────────────────────────────────────────────────
 
 def _to_telethon_entities(entities_json: list[dict]) -> list:
     out = []
@@ -346,13 +415,7 @@ def _to_telethon_entities(entities_json: list[dict]) -> list:
 
 
 def _normalize_chat_id(chat_id: str) -> str:
-    """
-    Нормализовать chat_id перед резолвом:
-      - убрать лишние @ (@@username → @username)
-      - убрать пробелы
-    """
     chat_id = chat_id.strip()
-    # Убираем повторяющиеся @ в начале
     if chat_id.startswith("@"):
         username = chat_id.lstrip("@")
         return f"@{username}"
@@ -360,12 +423,7 @@ def _normalize_chat_id(chat_id: str) -> str:
 
 
 async def resolve_entity(client, chat_id: str):
-    """
-    Найти чат по ID или username.
-    Нормализует chat_id перед поиском (убирает двойной @@).
-    """
     chat_id = _normalize_chat_id(chat_id)
-
     log.debug("resolve_entity: '%s'", chat_id)
 
     if chat_id.startswith("@"):
@@ -377,18 +435,15 @@ async def resolve_entity(client, chat_id: str):
 
     if chat_id.lstrip("-").isdigit():
         numeric = int(chat_id)
-
         try:
             return await client.get_entity(numeric)
         except Exception:
             pass
-
         if numeric > 0:
             try:
                 return await client.get_entity(int(f"-100{numeric}"))
             except Exception:
                 pass
-
         if chat_id.startswith("-100"):
             inner = chat_id[4:]
             if inner.isdigit():
@@ -396,7 +451,6 @@ async def resolve_entity(client, chat_id: str):
                     return await client.get_entity(int(inner))
                 except Exception:
                     pass
-
         return None
 
     try:
@@ -431,6 +485,21 @@ async def check_accounts():
         await db.commit()
 
 
+async def check_restrictions():
+    global _restriction_check_running
+    if _restriction_check_running:
+        log.debug("Проверка ограничений уже запущена, пропускаем")
+        return
+    _restriction_check_running = True
+    try:
+        from services.restriction_service import run_full_restriction_check
+        await run_full_restriction_check()
+    except Exception as e:
+        log.error("Ошибка в check_restrictions: %s", e)
+    finally:
+        _restriction_check_running = False
+
+
 # ── Точка входа ───────────────────────────────────────────────────────────────
 
 async def main():
@@ -441,10 +510,12 @@ async def main():
     scheduler.add_job(check_restrictions, "interval", minutes=30, id="__restrictions__")
 
     scheduler.start()
-    log.info("Воркер запущен.")
+    log.info("Воркер запущен (per-chat scheduling).")
 
     await sync_tasks()
-    asyncio.get_event_loop().call_later(60, lambda: asyncio.create_task(check_restrictions()))
+    asyncio.get_event_loop().call_later(
+        60, lambda: asyncio.create_task(check_restrictions())
+    )
 
     while True:
         await asyncio.sleep(60)
