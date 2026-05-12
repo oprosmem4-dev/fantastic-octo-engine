@@ -9,7 +9,8 @@ worker/worker.py — воркер рассылок.
   - get_dialogs() убран из цикла отправки (лишняя активность).
   - Невидимая рандомизация текста: zero-width space вставляется в случайную
     позицию — визуально текст не меняется, хэш сообщения разный.
-  - _ChatSendState хранит last_sent_at в памяти между итерациями.
+  - Фото скачиваются свежим перед каждой отправкой (избегаем устаревших file_id).
+  - Правильная работа с BytesIO буферами: seek(0) перед каждым использованием.
 """
 import asyncio
 import io
@@ -66,6 +67,12 @@ def _randomize_text(text: str) -> str:
 # ── Загрузка фото через Bot API ───────────────────────────────────────────────
 
 async def download_photos(file_ids: list[str]) -> list[io.BytesIO]:
+    """
+    Скачивает фото по file_id и возвращает список BytesIO объектов.
+    Каждый объект готов к чтению (seek(0) уже сделан).
+    
+    Если не удалось скачать какое-то фото, оно пропускается, но процесс продолжается.
+    """
     if not file_ids:
         return []
 
@@ -74,17 +81,23 @@ async def download_photos(file_ids: list[str]) -> list[io.BytesIO]:
     try:
         for i, file_id in enumerate(file_ids):
             try:
+                log.debug("Скачиваю фото %d (file_id: %s...)", i, file_id[:20])
                 tg_file = await bot.get_file(file_id)
                 buf = io.BytesIO()
                 await bot.download_file(tg_file.file_path, destination=buf)
-                buf.seek(0)
+                buf.seek(0)  # ← Важно: сбросить позицию для чтения
                 buf.name = f"photo_{i}.jpg"
                 results.append(buf)
+                log.debug("✓ Фото %d загружено успешно (%d байт)", i, buf.getbuffer().nbytes)
             except Exception as e:
-                log.error("Не удалось скачать file_id %s: %s", file_id, e)
+                log.error("✗ Не удалось скачать file_id %s: %s", file_id[:20], e)
+                # Продолжаем, пропускаем это фото
     finally:
         await bot.session.close()
 
+    if not results and file_ids:
+        log.warning("⚠️  Не удалось загрузить ни одно из %d фото", len(file_ids))
+    
     return results
 
 
@@ -164,7 +177,7 @@ async def sync_tasks():
                 log.info("Обновлён интервал job %s → %d мин.", job_id, interval)
 
 
-# ── Job для одного чата ───────────────────────────────────────────────────────
+# ── Job для одного чата ──────────────────────────────────────────────────────
 
 async def send_chat_job(task_id: int, account_id: int, chat_id: str):
     """
@@ -216,10 +229,6 @@ async def send_chat_job(task_id: int, account_id: int, chat_id: str):
         except Exception:
             format_entities_json = []
 
-        photo_bytes: list[io.BytesIO] = []
-        if photo_file_ids:
-            photo_bytes = await download_photos(photo_file_ids)
-
         client = make_client(account)
         try:
             await client.connect()
@@ -234,7 +243,7 @@ async def send_chat_job(task_id: int, account_id: int, chat_id: str):
             success = await send_to_chat(
                 db, client, account, task_id, chat_id,
                 message_text=message_text,
-                photo_bytes=photo_bytes,
+                photo_file_ids=photo_file_ids,
                 entities_json=format_entities_json,
             )
 
@@ -277,7 +286,7 @@ def _make_job_id(task_id: int, account_id: int, chat_id: str) -> str:
     return f"chat_{task_id}_{account_id}_{safe}"
 
 
-# ── Отправка в один чат ───────────────────────────────────────────────────────
+# ── Отправка в один чат ──────────────────────────────────────────────────────
 
 async def send_to_chat(
     db: AsyncSession,
@@ -286,12 +295,13 @@ async def send_to_chat(
     task_id: int,
     chat_id: str,
     message_text: str,
-    photo_bytes: list[io.BytesIO],
+    photo_file_ids: list[str],
     entities_json: list[dict],
 ) -> bool:
     """
     Отправляет сообщение в один чат.
     Текст рандомизируется (zero-width char) — визуально не меняется.
+    Фото скачиваются свежим перед отправкой (избегаем устаревших file_id).
     Возвращает True при успехе.
     """
     success = False
@@ -300,6 +310,13 @@ async def send_to_chat(
     # Рандомизируем текст перед отправкой
     send_text = _randomize_text(message_text)
 
+    # Скачиваем фото свежим (избегаем проблемы с устаревшими file_id)
+    photo_bytes: list[io.BytesIO] = []
+    if photo_file_ids:
+        photo_bytes = await download_photos(photo_file_ids)
+        if not photo_bytes and photo_file_ids:
+            log.warning("Не удалось загрузить фото, отправляем без изображения")
+
     try:
         entity = await resolve_entity(client, chat_id)
         if entity is None:
@@ -307,9 +324,12 @@ async def send_to_chat(
             log.warning("Не удалось найти чат %s", chat_id)
         else:
             entities = _to_telethon_entities(entities_json)
+            
             if photo_bytes:
+                # Подготавливаем буферы к чтению
                 for buf in photo_bytes:
                     buf.seek(0)
+                
                 files = photo_bytes if len(photo_bytes) > 1 else photo_bytes[0]
                 await client.send_file(
                     entity,
@@ -328,16 +348,25 @@ async def send_to_chat(
     except FloodWaitError as e:
         log.warning("FloodWait %d сек. для %s в %s", e.seconds, account.phone, chat_id)
         await asyncio.sleep(min(e.seconds, 60))
+        
         # Повторная попытка после ожидания
         try:
             entity = await resolve_entity(client, chat_id)
             if entity:
-                for buf in photo_bytes:
+                # Скачиваем фото заново для повторной попытки
+                photo_bytes_retry: list[io.BytesIO] = []
+                if photo_file_ids:
+                    photo_bytes_retry = await download_photos(photo_file_ids)
+                
+                # Подготавливаем буферы
+                for buf in photo_bytes_retry:
                     buf.seek(0)
+                
                 entities = _to_telethon_entities(entities_json)
                 retry_text = _randomize_text(message_text)
-                if photo_bytes:
-                    files = photo_bytes if len(photo_bytes) > 1 else photo_bytes[0]
+                
+                if photo_bytes_retry:
+                    files = photo_bytes_retry if len(photo_bytes_retry) > 1 else photo_bytes_retry[0]
                     await client.send_file(
                         entity,
                         file=files,
@@ -353,6 +382,7 @@ async def send_to_chat(
                 success = True
         except Exception as retry_err:
             error_text = str(retry_err)
+            log.error("Ошибка при повторной попытке отправки: %s", retry_err)
 
     except (UserBannedInChannelError, ChatWriteForbiddenError) as e:
         error_text = f"нет доступа: {type(e).__name__}"
@@ -380,7 +410,7 @@ async def send_to_chat(
     return success
 
 
-# ── Вспомогательные функции ───────────────────────────────────────────────────
+# ── Вспомогательные функции ──────────────────────────────────────────────────
 
 def _to_telethon_entities(entities_json: list[dict]) -> list:
     out = []
@@ -500,7 +530,7 @@ async def check_restrictions():
         _restriction_check_running = False
 
 
-# ── Точка входа ───────────────────────────────────────────────────────────────
+# ── Точка входа ──────────────────────────────────────────────────────────────
 
 async def main():
     await create_all_tables()
