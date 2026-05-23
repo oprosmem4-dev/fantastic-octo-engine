@@ -2,11 +2,12 @@
 services/account_service.py — управление Telegram-аккаунтами (Telethon).
 
 ИЗМЕНЕНИЯ:
-  - can_write_to_chat: обработка discussion group (вступаем в родительский канал)
-  - check_and_join_chats: для папок — массовое вступление + лёгкая проверка прав
-    (без тестовой отправки). 100 чатов ~30 сек вместо 30+ минут.
-  - Тестовая отправка только для чатов введённых вручную (folder_slug is None).
-  - get_accounts: добавлен параметр only_working для admin-панели.
+  - make_client: поддержка прокси (socks5/http) из полей Account
+  - can_write_to_chat: убрана тестовая отправка "." — используем только
+    GetParticipantRequest + проверку прав. Тестовая отправка реального
+    сообщения пользователя делается снаружи (в воркере) при первой рассылке.
+  - check_and_join_chats: аналогично — только лёгкая проверка без отправки
+  - get_accounts: параметр only_working
 """
 import asyncio
 import logging
@@ -40,14 +41,9 @@ async def get_accounts(
     owner_id: int | None = None,
     only_working: bool = True,
 ) -> list[Account]:
-    """
-    owner_id=None  → системные аккаунты (is_system=True).
-    owner_id=X     → аккаунты пользователя X.
-    only_working   → фильтр is_active/is_banned (по умолчанию True).
-    """
     q = select(Account)
     if only_working:
-        q = q.where(Account.is_active == True, Account.is_banned == False)
+        q = q.where(Account.is_active == True, Account.is_banned == False, Account.status == "ok")
     if owner_id is not None:
         q = q.where(Account.owner_id == owner_id)
     else:
@@ -69,6 +65,11 @@ async def create_account(
     session_string: str,
     owner_id: int | None = None,
     is_system: bool = False,
+    proxy_host: str | None = None,
+    proxy_port: int | None = None,
+    proxy_type: str | None = None,
+    proxy_user: str | None = None,
+    proxy_pass: str | None = None,
 ) -> Account:
     acc = Account(
         owner_id=owner_id,
@@ -77,6 +78,11 @@ async def create_account(
         api_hash=api_hash,
         session_string=session_string,
         is_system=is_system,
+        proxy_host=proxy_host,
+        proxy_port=proxy_port,
+        proxy_type=proxy_type,
+        proxy_user=proxy_user,
+        proxy_pass=proxy_pass,
     )
     db.add(acc)
     await db.commit()
@@ -108,15 +114,62 @@ async def update_chats_count(db: AsyncSession, account_id: int, count: int):
         await db.commit()
 
 
-# ── Telethon: auth ────────────────────────────────────────────────────────────
+async def set_proxy(
+    db: AsyncSession,
+    account_id: int,
+    proxy_host: str | None,
+    proxy_port: int | None,
+    proxy_type: str | None,
+    proxy_user: str | None,
+    proxy_pass: str | None,
+) -> bool:
+    """Установить или убрать прокси для аккаунта."""
+    acc = await get_account_by_id(db, account_id)
+    if not acc:
+        return False
+    acc.proxy_host = proxy_host
+    acc.proxy_port = proxy_port
+    acc.proxy_type = proxy_type
+    acc.proxy_user = proxy_user
+    acc.proxy_pass = proxy_pass
+    await db.commit()
+    return True
+
+
+# ── Telethon: создание клиента ────────────────────────────────────────────────
 
 def make_client(acc: Account) -> TelegramClient:
+    """
+    Создать TelegramClient для аккаунта.
+    Если у аккаунта заданы поля прокси — подключаться через него.
+    Поддерживаемые типы: socks5 (default), http.
+    """
+    proxy = None
+    if acc.proxy_host and acc.proxy_port:
+        try:
+            import socks  # PySocks
+            proxy_type = socks.SOCKS5 if (acc.proxy_type or "socks5").lower() == "socks5" else socks.HTTP
+            proxy = (
+                proxy_type,
+                acc.proxy_host,
+                acc.proxy_port,
+                True,                   # rdns
+                acc.proxy_user or None,
+                acc.proxy_pass or None,
+            )
+            log.debug("Аккаунт %s → прокси %s:%d", acc.phone, acc.proxy_host, acc.proxy_port)
+        except ImportError:
+            log.error("PySocks не установлен — pip install PySocks. Прокси игнорирован.")
+
     return TelegramClient(
         StringSession(acc.session_string),
         int(acc.api_id),
         acc.api_hash,
+        proxy=proxy,
     )
 
+
+# ── Telethon: auth ────────────────────────────────────────────────────────────
 
 async def send_code(api_id: int, api_hash: str, phone: str) -> tuple[TelegramClient, str]:
     client = TelegramClient(StringSession(), api_id, api_hash)
@@ -145,16 +198,6 @@ async def get_me_name(client: TelegramClient) -> str:
 # ── Папки ─────────────────────────────────────────────────────────────────────
 
 async def get_chats_from_folder(client: TelegramClient, folder_link: str) -> list[dict]:
-    """
-    Получить чаты из папки https://t.me/addlist/XXXX.
-
-    Возвращает список dict:
-      id          — строка "-100XXXXXXXXXX" или "-XXXXXXXXXX"
-      title       — название чата
-      username    — username без @ (или None)
-      access_hash — (или None)
-      folder_slug — slug папки для массового вступления
-    """
     slug = folder_link.rstrip("/").split("/")[-1]
     chats: list[dict] = []
     try:
@@ -165,18 +208,10 @@ async def get_chats_from_folder(client: TelegramClient, folder_link: str) -> lis
             peer_id = getattr(peer, "id", None)
             if peer_id is None:
                 continue
-
-            title = (
-                getattr(peer, "title", None)
-                or getattr(peer, "first_name", None)
-                or str(peer_id)
-            )
+            title       = getattr(peer, "title", None) or getattr(peer, "first_name", None) or str(peer_id)
             username    = getattr(peer, "username", None)
             access_hash = getattr(peer, "access_hash", None)
-
-            # Каналы/супергруппы имеют access_hash → prefix -100
-            str_id = f"-100{peer_id}" if access_hash is not None else str(-abs(peer_id))
-
+            str_id      = f"-100{peer_id}" if access_hash is not None else str(-abs(peer_id))
             chats.append({
                 "id":          str_id,
                 "title":       title,
@@ -184,26 +219,18 @@ async def get_chats_from_folder(client: TelegramClient, folder_link: str) -> lis
                 "access_hash": access_hash,
                 "folder_slug": slug,
             })
-
         log.info("Получено %d чатов из папки %s", len(chats), folder_link)
     except Exception as e:
         log.warning("Ошибка получения папки %s: %s", folder_link, e)
-
     return chats
 
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
 
 async def _resolve_entity(client: TelegramClient, chat_id: str):
-    """
-    Резолв entity по строковому ID.
-    Пробует: числовой int → -100 prefix → строку как есть.
-    """
     s = str(chat_id).strip()
-
     if s.startswith("@"):
         return await client.get_entity(s)
-
     if s.lstrip("-").isdigit():
         numeric = int(s)
         try:
@@ -216,12 +243,10 @@ async def _resolve_entity(client: TelegramClient, chat_id: str):
             except Exception:
                 pass
         return None
-
     return await client.get_entity(s)
 
 
 async def _join_single(client: TelegramClient, entity) -> tuple[bool, str]:
-    """Вступить в один канал/супергруппу."""
     from telethon.tl.functions.channels import JoinChannelRequest
     try:
         await client(JoinChannelRequest(entity))
@@ -238,7 +263,6 @@ async def _join_single(client: TelegramClient, entity) -> tuple[bool, str]:
 
 
 async def _join_folder_bulk(client: TelegramClient, slug: str) -> bool:
-    """Массово вступить во все чаты папки одним запросом."""
     try:
         from telethon.tl.functions.chatlists import JoinChatlistInviteRequest
         await client(JoinChatlistInviteRequest(slug=slug, peers=[]))
@@ -252,13 +276,13 @@ async def _join_folder_bulk(client: TelegramClient, slug: str) -> bool:
 async def _check_write_light(client: TelegramClient, chat_id: str) -> tuple[bool | None, str]:
     """
     Лёгкая проверка прав без отправки сообщений.
-    Использует GetParticipantRequest.
+    Использует GetParticipantRequest для каналов/супергрупп.
 
     Возвращает:
-      (True, "ok")            — можно писать
-      (False, reason)         — нельзя писать
-      (None, "not_participant") — ещё не вступили (bulk join не добавил)
-      (None, "ok")            — GetParticipant не применим (обычная группа) → считаем OK
+      (True, "ok")              — можно писать
+      (False, reason)           — нельзя
+      (None, "not_participant") — не вступили ещё
+      (None, "ok")              — обычная группа, считаем OK
     """
     from telethon.tl import types as tl_types
     from telethon.tl.functions.channels import GetParticipantRequest
@@ -276,7 +300,6 @@ async def _check_write_light(client: TelegramClient, chat_id: str) -> tuple[bool
         return False, "not_found"
 
     if not isinstance(entity, tl_types.Channel):
-        # Обычная группа — GetParticipant не нужен, считаем OK
         return None, "ok"
 
     try:
@@ -292,7 +315,6 @@ async def _check_write_light(client: TelegramClient, chat_id: str) -> tuple[bool
             return False, "write_forbidden"
 
         return True, "ok"
-
     except Exception as e:
         err = str(e).lower()
         if "not_participant" in err or "not participant" in err:
@@ -301,75 +323,8 @@ async def _check_write_light(client: TelegramClient, chat_id: str) -> tuple[bool
             return False, "banned"
         if "private" in err or "channel_private" in err:
             return False, "private"
-        # Другие ошибки GetParticipant — не критично, считаем OK
         log.debug("GetParticipant %s: %s", chat_id, e)
         return None, "ok"
-
-
-async def _test_send(
-    client: TelegramClient,
-    entity,
-    chat_id: str,
-    _retry: bool = False,
-) -> tuple[bool, str]:
-    """
-    Тестовая отправка "." + немедленное удаление.
-    При ошибке discussion group — вступает в родительский канал и повторяет (один раз).
-    """
-    from telethon.tl.functions.channels import GetFullChannelRequest, JoinChannelRequest
-    from telethon.tl import types as tl_types
-
-    try:
-        msg = await client.send_message(entity, ".")
-        try:
-            await client.delete_messages(entity, [msg.id])
-        except Exception:
-            pass
-        return True, "ok"
-
-    except FloodWaitError as e:
-        log.warning("FloodWait %ds при проверке %s", e.seconds, chat_id)
-        return True, "ok"   # FloodWait ≠ нельзя писать
-
-    except SlowModeWaitError:
-        return True, "ok"
-
-    except UserBannedInChannelError:
-        return False, "banned"
-
-    except ChatWriteForbiddenError:
-        return False, "write_forbidden"
-
-    except Exception as e:
-        err_str  = str(e)
-        err_low  = err_str.lower()
-
-        # Discussion group — нужно вступить в родительский канал
-        if "discussion" in err_low and not _retry:
-            log.info("Discussion group %s — ищу родительский канал", chat_id)
-            try:
-                if isinstance(entity, tl_types.Channel):
-                    full      = await client(GetFullChannelRequest(entity))
-                    linked_id = getattr(full.full_chat, "linked_chat_id", None)
-                    if linked_id:
-                        parent = await client.get_entity(linked_id)
-                        await client(JoinChannelRequest(parent))
-                        await asyncio.sleep(2)
-                        log.info("Вступил в родительский канал %s для %s", linked_id, chat_id)
-                        return await _test_send(client, entity, chat_id, _retry=True)
-            except Exception as je:
-                log.warning("Не удалось вступить в родитель для %s: %s", chat_id, je)
-            return False, "discussion_no_parent"
-
-        if "banned" in err_low:
-            return False, "banned"
-        if "forbidden" in err_low or "not allowed" in err_low:
-            return False, "write_forbidden"
-        if "private" in err_low or "channel_private" in err_low:
-            return False, "private"
-
-        log.warning("Неизвестная ошибка при проверке %s: %s", chat_id, err_str)
-        return False, err_str[:80]
 
 
 # ── Публичные функции проверки ────────────────────────────────────────────────
@@ -381,12 +336,12 @@ async def can_write_to_chat(
     access_hash: int | None = None,
 ) -> tuple[bool, str]:
     """
-    Полная проверка с тестовой отправкой. Только для ручного ввода чатов.
-    Обрабатывает discussion group автоматически.
+    Проверка доступа к чату БЕЗ тестовой отправки.
+    Использует только GetParticipantRequest + проверку прав.
+    Фактическая отправка происходит при первой рассылке в воркере.
     """
     from telethon.tl.functions.messages import ImportChatInviteRequest
 
-    # Резолв
     entity = None
     if username:
         try:
@@ -407,7 +362,7 @@ async def can_write_to_chat(
     if entity is None:
         return False, "not_found"
 
-    # Вступление
+    # Invite-ссылки: вступаем, потом проверяем
     if chat_id.startswith("https://t.me/+") or chat_id.startswith("t.me/+"):
         invite_hash = chat_id.rstrip("/").split("+")[-1]
         try:
@@ -431,7 +386,12 @@ async def can_write_to_chat(
         except Exception:
             pass
 
-    return await _test_send(client, entity, chat_id)
+    # Лёгкая проверка прав
+    can, reason = await _check_write_light(client, chat_id)
+    if can is None:
+        # Обычная группа или не удалось определить — считаем OK
+        return True, "ok"
+    return can, reason
 
 
 async def check_and_join_chats(
@@ -439,20 +399,10 @@ async def check_and_join_chats(
     chats: list[dict],
 ) -> list[dict]:
     """
-    Проверить доступ к списку чатов.
-
-    Папки (folder_slug задан):
-      • Одним запросом JoinChatlistInviteRequest вступаем во все чаты папки.
-      • Лёгкая проверка прав через GetParticipantRequest (без отправки сообщений).
-      • Скорость: ~30 сек на 100 чатов.
-
-    Ручной ввод (folder_slug is None):
-      • Полная проверка с тестовой отправкой "." + удаление.
-
-    Возвращает список:
-      {"id", "title", "username", "can_write", "reason", "link"}
+    Проверить доступ к чатам.
+    Папки: bulk join + лёгкая проверка прав (без отправки).
+    Ручной ввод: вступление + лёгкая проверка прав (без отправки).
     """
-    # Массовое вступление — один запрос на уникальную папку
     done_slugs: set[str] = set()
     for chat in chats:
         slug = chat.get("folder_slug")
@@ -461,7 +411,6 @@ async def check_and_join_chats(
             done_slugs.add(slug)
 
     if done_slugs:
-        # Даём TG время обновить членство
         await asyncio.sleep(3)
 
     results: list[dict] = []
@@ -471,15 +420,12 @@ async def check_and_join_chats(
         title    = chat.get("title", chat_id)
         username = chat.get("username")
         slug     = chat.get("folder_slug")
-
-        link = f"https://t.me/{username}" if username else None
+        link     = f"https://t.me/{username}" if username else None
 
         if slug:
-            # ── Быстрый путь (папка) ──────────────────────────────────────────
             can_write, reason = await _check_write_light(client, chat_id)
 
             if can_write is None and reason == "not_participant":
-                # bulk join не добавил — пробуем поштучно если есть username
                 if username:
                     try:
                         entity = await client.get_entity(f"@{username}")
@@ -494,18 +440,12 @@ async def check_and_join_chats(
                     except Exception:
                         can_write, reason = False, "not_found"
                 else:
-                    # Приватный чат без username — недоступен
                     can_write, reason = False, "private"
-
             elif can_write is None:
-                # GetParticipant не применим (обычная группа) — считаем OK
                 can_write, reason = True, "ok"
-
         else:
-            # ── Полная проверка (ручной ввод) ─────────────────────────────────
             can_write, reason = await can_write_to_chat(
-                client,
-                chat_id,
+                client, chat_id,
                 username=username,
                 access_hash=chat.get("access_hash"),
             )
