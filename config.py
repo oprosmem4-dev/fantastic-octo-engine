@@ -7,9 +7,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Telegram боты ─────────────────────────────────────────────────────────────
-BOT_TOKEN          = os.environ["BOT_TOKEN"]           # токен главного бота (для воркера)
-GENERATOR_BOT_TOKEN = os.environ["GENERATOR_BOT_TOKEN"] # токен бота-регистратора зеркал
-OWNER_ID           = int(os.environ["OWNER_ID"])
+BOT_TOKEN           = os.environ["BOT_TOKEN"]
+GENERATOR_BOT_TOKEN = os.environ["GENERATOR_BOT_TOKEN"]
+OWNER_ID            = int(os.environ["OWNER_ID"])
 
 # ── База данных ───────────────────────────────────────────────────────────────
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -35,10 +35,18 @@ SUBSCRIPTION_PRICES = {
 MAX_CHATS_PER_USER = 100
 TRIAL_DAYS         = 3
 
-# ── Ссылка на бота-регистратора (для зеркал — куда слать оплату) ──────────────
-# Теперь MAIN_BOT_LINK ведёт на generator бот, т.к. именно там регистрация.
-# Если нужна отдельная ссылка для оплаты — задайте PAYMENT_BOT_LINK.
-MAIN_BOT_LINK  = os.getenv("MAIN_BOT_LINK", "https://t.me/your_generator_bot")
+# ── Rate limiting для воркера ─────────────────────────────────────────────────
+# Минимальный интервал (секунды) между двумя отправками одного аккаунта.
+# 8 секунд = ~450 отправок/час максимум (на практике меньше из-за интервалов задач).
+# Рекомендуется: 8-15. Увеличьте при спамблоках.
+MIN_SEND_INTERVAL = int(os.getenv("MIN_SEND_INTERVAL", "8"))
+
+# Мягкий лимит отправок в час на аккаунт. При превышении аккаунт получает
+# меньший приоритет при балансировке (новые чаты идут на менее нагруженные).
+MAX_SENDS_PER_HOUR = int(os.getenv("MAX_SENDS_PER_HOUR", "40"))
+
+# ── Ссылки ────────────────────────────────────────────────────────────────────
+MAIN_BOT_LINK    = os.getenv("MAIN_BOT_LINK",    "https://t.me/your_generator_bot")
 PAYMENT_BOT_LINK = os.getenv("PAYMENT_BOT_LINK", MAIN_BOT_LINK)
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
@@ -49,15 +57,9 @@ API_SECRET = os.environ["API_SECRET"]
 # ── Проверка спамблока ────────────────────────────────────────────────────────
 SPAMCHECK_USERNAME = os.getenv("SPAMCHECK_USERNAME", "")
 
-# ── Mirror runner: шардирование (опционально) ─────────────────────────────────
-# Позволяет запустить несколько mirror_runner на разных серверах,
-# разделив ответственность по user_id.
-# Пример: сервер 1: SHARD_MIN=0, SHARD_MAX=500000
-#          сервер 2: SHARD_MIN=500000, SHARD_MAX=None
+# ── Mirror runner ─────────────────────────────────────────────────────────────
 _shard_min = os.getenv("MIRROR_SHARD_MIN")
 _shard_max = os.getenv("MIRROR_SHARD_MAX")
 MIRROR_SHARD_MIN: int | None = int(_shard_min) if _shard_min else None
 MIRROR_SHARD_MAX: int | None = int(_shard_max) if _shard_max else None
-
-# ── Mirror runner: задержка перезапуска при падении зеркала ──────────────────
-MIRROR_RESTART_DELAY = int(os.getenv("MIRROR_RESTART_DELAY", "10"))  # секунды
+MIRROR_RESTART_DELAY = int(os.getenv("MIRROR_RESTART_DELAY", "10"))
