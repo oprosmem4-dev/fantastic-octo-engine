@@ -3,10 +3,11 @@ bot/handlers/tasks.py — создание и управление задача�
 
 ИСПРАВЛЕНИЯ:
   - Везде используется parse_mode="HTML" вместо Markdown
-  - Пользовательские данные (названия чатов, имена задач) экранируются через html.escape()
-  - Это исключает ошибку "Can't find end of the entity" при символах _ * ` [ в названиях чатов
-  - got_task_chats: chat_id при ручном вводе всегда нормализуется (убираем @@)
-  - _normalize_chat_id: вспомогательная функция для единообразия
+  - Пользовательские данные экранируются через html.escape()
+  - got_task_chats: chat_id нормализуется (убираем @@)
+  - _recode_photo_to_main_bot: при создании задачи в зеркале фото пересылается
+    через основной бот и сохраняется его file_id — воркер всегда скачивает
+    через стабильный BOT_TOKEN независимо от состояния зеркал
 """
 import html
 import logging
@@ -59,12 +60,6 @@ async def cb_cancel_to_menu(query: CallbackQuery, state: FSMContext, user: User)
 # ── Утилиты ───────────────────────────────────────────────────────────────────
 
 def _normalize_chat_id(raw: str) -> str:
-    """
-    Нормализовать введённый пользователем chat_id.
-    @@username → @username
-    @username  → @username
-    -100123    → -100123
-    """
     s = raw.strip()
     if s.startswith("@"):
         username = s.lstrip("@")
@@ -73,7 +68,6 @@ def _normalize_chat_id(raw: str) -> str:
 
 
 def _chat_display(title: str, username: str | None, link: str | None) -> str:
-    """Форматирование чата для HTML."""
     url = f"https://t.me/{username}" if username else link
     if url:
         return f'<a href="{url}">{html.escape(title)}</a>'
@@ -81,12 +75,51 @@ def _chat_display(title: str, username: str | None, link: str | None) -> str:
 
 
 def _chat_display_from_task_chat(c) -> str:
-    """Форматирование TaskChat для HTML."""
     ct = c.chat_title or ""
     if ct.startswith("@"):
         uname = ct.lstrip("@")
         return f'<a href="https://t.me/{uname}">{html.escape(ct)}</a>'
     return html.escape(ct) if ct else html.escape(c.chat_id)
+
+
+async def _recode_photo_to_main_bot(current_bot, file_id: str) -> str:
+    """
+    Пересылает фото через основной бот и возвращает новый file_id привязанный
+    к BOT_TOKEN. Это нужно потому что file_id привязан к конкретному боту:
+    фото загруженное в зеркало нельзя скачать через основной бот.
+
+    Если перекодирование не удалось — возвращает оригинальный file_id
+    (воркер попробует скачать сам, а если не выйдет — отправит только текст).
+    """
+    from config import BOT_TOKEN, OWNER_ID
+    from aiogram import Bot as AiogramBot
+
+    # Уже правильный токен — перекодирование не нужно
+    if current_bot.token == BOT_TOKEN:
+        return file_id
+
+    try:
+        main_bot = AiogramBot(token=BOT_TOKEN)
+        try:
+            # Пересылаем фото владельцу через основной бот.
+            # Telegram сам загрузит файл и вернёт новый file_id от этого бота.
+            sent = await main_bot.send_photo(chat_id=OWNER_ID, photo=file_id)
+            # Сразу удаляем чтобы не засорять чат владельца
+            try:
+                await main_bot.delete_message(OWNER_ID, sent.message_id)
+            except Exception:
+                pass
+            new_file_id = sent.photo[-1].file_id
+            log.debug("Фото перекодировано: %s → %s", file_id[:15], new_file_id[:15])
+            return new_file_id
+        finally:
+            await main_bot.session.close()
+    except Exception as e:
+        log.warning(
+            "Не удалось перекодировать file_id %s через основной бот: %s — используем оригинал",
+            file_id[:20], e,
+        )
+        return file_id
 
 
 # ── Список задач ──────────────────────────────────────────────────────────────
@@ -262,16 +295,21 @@ async def got_task_message(message: Message, state: FSMContext):
 
     photo_file_ids: list[str] = []
     if message.photo:
-        photo_file_ids.append(message.photo[-1].file_id)
+        # Перекодируем file_id через основной бот чтобы воркер мог скачать
+        # независимо от того, через какое зеркало создаётся задача
+        recoded = await _recode_photo_to_main_bot(message.bot, message.photo[-1].file_id)
+        photo_file_ids.append(recoded)
 
     media_group_id = getattr(message, "media_group_id", None)
     if media_group_id:
         data = await state.get_data()
-        mg   = data.get("media_group", {"id": media_group_id, "photos": [], "text": "", "entities": []})
+        mg = data.get("media_group", {"id": media_group_id, "photos": [], "text": "", "entities": []})
         if mg.get("id") != media_group_id:
             mg = {"id": media_group_id, "photos": [], "text": "", "entities": []}
         if message.photo:
-            mg["photos"].append(message.photo[-1].file_id)
+            # Перекодируем каждое фото из медиагруппы
+            recoded = await _recode_photo_to_main_bot(message.bot, message.photo[-1].file_id)
+            mg["photos"].append(recoded)
         if text:
             mg["text"]     = text
             mg["entities"] = entities_json
@@ -292,7 +330,7 @@ async def got_task_message(message: Message, state: FSMContext):
     if (message.text or "").strip().lower() in {"ок", "ok", "да", "done"} and mg and mg.get("photos"):
         text           = mg.get("text", "")
         entities_json  = mg.get("entities", [])
-        photo_file_ids = mg.get("photos", [])
+        photo_file_ids = mg.get("photos", [])  # уже перекодированы ранее
         await state.update_data(media_group=None)
 
     if not text and not photo_file_ids:
@@ -386,7 +424,6 @@ async def got_task_chats(message: Message, state: FSMContext, user: User, db: As
             if not line:
                 continue
 
-            # Нормализуем сразу при вводе — убираем лишние @
             if line.startswith("@"):
                 username = line.lstrip("@")
                 chat_id  = f"@{username}"
@@ -414,7 +451,6 @@ async def got_task_chats(message: Message, state: FSMContext, user: User, db: As
 
     await state.update_data(chats=chats)
 
-    # Превью — экранируем все названия через html.escape()
     preview_lines = []
     for c in chats[:10]:
         uname = c.get("username")
