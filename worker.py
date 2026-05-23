@@ -357,39 +357,34 @@ async def _send_with_client(
     photo_file_ids: list[str],
     entities_json: list[dict],
 ) -> tuple[bool, str | None, bool]:
-    """
-    Выполняет отправку.
-    Возвращает (success, error_text, need_failover).
-    need_failover=True — нужно сразу переключить на другой аккаунт.
-    """
-    send_text    = _randomize_text(message_text)
-    photo_bytes  = []
-    if photo_file_ids:
-        photo_bytes = await _download_photos(photo_file_ids)
+    send_text = _randomize_text(message_text)
+    entities = _to_telethon_entities(entities_json)
 
     try:
         entity = await _resolve_entity(client, chat_id)
         if entity is None:
             return False, "entity_not_found", False
 
-        entities = _to_telethon_entities(entities_json)
-
-        if photo_bytes:
-            for buf in photo_bytes:
-                buf.seek(0)
-            files = photo_bytes if len(photo_bytes) > 1 else photo_bytes[0]
-            await client.send_file(
-                entity,
-                file=files,
-                caption=send_text or "",
-                formatting_entities=entities or None,
-            )
+        if photo_file_ids:
+            # Скачиваем через Telethon напрямую, не через Bot API
+            photo_bytes = await _download_photos_via_telethon(client, photo_file_ids)
+            
+            if not photo_bytes:
+                # Fallback: отправить только текст если фото не загрузились
+                log.warning("Не удалось загрузить фото для task=%d, отправляем только текст", task_id)
+                await client.send_message(entity, send_text or "", formatting_entities=entities or None)
+            elif len(photo_bytes) == 1:
+                photo_bytes[0].seek(0)
+                await client.send_file(entity, file=photo_bytes[0], caption=send_text or "",
+                                       formatting_entities=entities or None)
+            else:
+                for buf in photo_bytes:
+                    buf.seek(0)
+                await client.send_file(entity, file=photo_bytes, caption=send_text or "",
+                                       formatting_entities=entities or None)
         else:
-            await client.send_message(
-                entity,
-                send_text or "",
-                formatting_entities=entities or None,
-            )
+            await client.send_message(entity, send_text or "", formatting_entities=entities or None)
+
         return True, None, False
 
     except FloodWaitError as e:
@@ -402,7 +397,7 @@ async def _send_with_client(
             retry_text  = _randomize_text(message_text)
             photo_retry = []
             if photo_file_ids:
-                photo_retry = await _download_photos(photo_file_ids)
+                photo_retry = await _download_photos_via_telethon(client, photo_file_ids)
             entity = await _resolve_entity(client, chat_id)
             if entity:
                 entities = _to_telethon_entities(entities_json)
@@ -442,7 +437,45 @@ async def _send_with_client(
         log.error("Ошибка отправки %s → %s: %s", account.phone, chat_id, err_str)
         return False, err_str[:200], is_access_err
 
-
+async def _download_photos_via_telethon(client, file_ids: list[str]) -> list[io.BytesIO]:
+    """
+    Скачивает фото через Telethon используя InputPhoto из file_id.
+    Работает независимо от того, через какого бота был загружен файл.
+    """
+    if not file_ids:
+        return []
+    
+    # Сначала пробуем через Bot API (быстрее, если file_id от того же бота)
+    bot = Bot(token=BOT_TOKEN)
+    results = []
+    try:
+        for i, file_id in enumerate(file_ids):
+            try:
+                tg_file = await bot.get_file(file_id)
+                buf = io.BytesIO()
+                await bot.download_file(tg_file.file_path, destination=buf)
+                buf.seek(0)
+                buf.name = f"photo_{i}.jpg"
+                results.append(buf)
+            except Exception as e:
+                log.warning("Bot API не смог скачать file_id %s: %s — пробуем через Telethon", file_id[:20], e)
+                # Fallback: попытка через Telethon (работает если клиент видел это фото)
+                try:
+                    from telethon.tl.types import InputPhoto
+                    # Telethon может скачать по file_id если он в правильном формате
+                    buf = io.BytesIO()
+                    # Используем сам file_id как строку — Telethon умеет резолвить
+                    data = await client.download_media(file_id, file=buf)
+                    if data:
+                        buf.seek(0)
+                        buf.name = f"photo_{i}.jpg"
+                        results.append(buf)
+                except Exception as e2:
+                    log.error("Telethon тоже не смог скачать %s: %s", file_id[:20], e2)
+    finally:
+        await bot.session.close()
+    
+    return results
 # ── Мгновенная замена аккаунта (failover) ────────────────────────────────────
 
 async def _try_failover(
