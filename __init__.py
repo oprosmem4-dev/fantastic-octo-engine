@@ -1,17 +1,15 @@
 """
 models/__init__.py — все модели базы данных в одном месте.
-Импортируй так: from models import User, Account, Task, ...
 
 ИЗМЕНЕНИЯ:
-  - Account.status (str): "ok" | "frozen" | "spamblocked"
-    Используется для отображения в боте (❄️ / 🚫 / ✅ / ⏸)
-    и для блокировки назначения новых задач на проблемные аккаунты.
+  - Account: добавлены поля прокси (proxy_host/port/type/user/pass)
+  - Account: добавлены поля sends_last_hour, sends_reset_at для rate-limit балансировки
 """
 
 from datetime import datetime, timezone
 from sqlalchemy import (
     BigInteger, Boolean, DateTime, Float, ForeignKey,
-    Integer, String, Text, Enum as SAEnum
+    Integer, String, Text,
 )
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 
@@ -27,25 +25,20 @@ def now_utc() -> datetime:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class User(Base):
-    """Пользователь бота."""
     __tablename__ = "users"
 
-    id: Mapped[int]          = mapped_column(BigInteger, primary_key=True)  # Telegram ID
+    id: Mapped[int]          = mapped_column(BigInteger, primary_key=True)
     username: Mapped[str | None] = mapped_column(String(64))
     full_name: Mapped[str]   = mapped_column(String(128), default="")
     is_blocked: Mapped[bool] = mapped_column(Boolean, default=False)
     is_admin: Mapped[bool]   = mapped_column(Boolean, default=False)
 
-    # Подписка
     trial_ends_at: Mapped[datetime | None]  = mapped_column(DateTime(timezone=True))
     sub_ends_at: Mapped[datetime | None]    = mapped_column(DateTime(timezone=True))
 
-    # Лимиты
     max_chats: Mapped[int] = mapped_column(Integer, default=100)
-
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
-    # Связи
     accounts: Mapped[list["Account"]] = relationship(back_populates="owner", lazy="selectin")
     tasks: Mapped[list["Task"]]       = relationship(back_populates="user",  lazy="selectin")
     mirror_bot: Mapped["MirrorBot | None"] = relationship(back_populates="user", uselist=False)
@@ -75,7 +68,6 @@ class User(Base):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MirrorBot(Base):
-    """Бот-зеркало — пользователь может добавить свой bot_token."""
     __tablename__ = "mirror_bots"
 
     id: Mapped[int]           = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -94,24 +86,25 @@ class MirrorBot(Base):
 
 class Account(Base):
     """
-    Telegram-аккаунт для рассылок (добавляется через Telethon).
+    Telegram-аккаунт для рассылок.
 
     Поле status:
-      "ok"          — аккаунт работает нормально
-      "frozen"      — Telegram деактивировал аккаунт (USER_DEACTIVATED и т.п.)
-      "spamblocked" — аккаунт получил ограничение на отправку (спамблок)
+      "ok"          — работает нормально
+      "frozen"      — Telegram деактивировал аккаунт
+      "spamblocked" — спамблок
 
-    В списке аккаунтов отображается с эмодзи:
-      ✅ — ok + активен
-      ⏸ — ok + приостановлен
-      ❄️ — frozen
-      🚫 — spamblocked
+    Прокси:
+      proxy_host / proxy_port / proxy_type ("socks5"|"http") / proxy_user / proxy_pass
+      Один прокси = не более 5 аккаунтов (контролируется логикой добавления).
+
+    Нагрузка:
+      sends_last_hour — количество отправок за текущий час (сбрасывается каждый час)
+      sends_reset_at  — когда был последний сброс счётчика
     """
     __tablename__ = "accounts"
 
     id: Mapped[int]           = mapped_column(Integer, primary_key=True, autoincrement=True)
     owner_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
-    # owner_id = None → системный аккаунт (добавлен администратором)
 
     phone: Mapped[str]        = mapped_column(String(32), unique=True)
     api_id: Mapped[int]       = mapped_column(Integer)
@@ -122,20 +115,38 @@ class Account(Base):
     is_banned: Mapped[bool]   = mapped_column(Boolean, default=False)
     is_system: Mapped[bool]   = mapped_column(Boolean, default=False)
 
-    # ── НОВОЕ: статус ограничений ─────────────────────────────────────────────
-    # "ok" | "frozen" | "spamblocked"
-    # Используется для отображения в боте и запрета назначения новых задач.
+    # Статус ограничений: "ok" | "frozen" | "spamblocked"
     status: Mapped[str]       = mapped_column(String(16), default="ok")
 
     chats_count: Mapped[int]  = mapped_column(Integer, default=0)
+
+    # ── Прокси ───────────────────────────────────────────────────────────────
+    proxy_host: Mapped[str | None] = mapped_column(String(128))
+    proxy_port: Mapped[int | None] = mapped_column(Integer)
+    proxy_type: Mapped[str | None] = mapped_column(String(16))   # "socks5" | "http"
+    proxy_user: Mapped[str | None] = mapped_column(String(64))
+    proxy_pass: Mapped[str | None] = mapped_column(String(128))
+
+    # ── Нагрузка (для балансировки) ───────────────────────────────────────────
+    sends_last_hour: Mapped[int] = mapped_column(Integer, default=0)
+    sends_reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
     owner: Mapped["User | None"] = relationship(back_populates="accounts")
     task_links: Mapped[list["TaskAccount"]] = relationship(back_populates="account")
 
     @property
+    def proxy_label(self) -> str:
+        """Строка для отображения прокси."""
+        if not self.proxy_host:
+            return "нет"
+        t = self.proxy_type or "socks5"
+        user_part = f"{self.proxy_user}@" if self.proxy_user else ""
+        return f"{t}://{user_part}{self.proxy_host}:{self.proxy_port}"
+
+    @property
     def status_icon(self) -> str:
-        """Эмодзи статуса для отображения в меню."""
         if self.status == "frozen":
             return "❄️"
         if self.status == "spamblocked":
@@ -144,7 +155,6 @@ class Account(Base):
 
     @property
     def status_label(self) -> str:
-        """Человекочитаемый статус."""
         if self.status == "frozen":
             return "❄️ Заморожен Telegram"
         if self.status == "spamblocked":
@@ -161,7 +171,6 @@ class Account(Base):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Task(Base):
-    """Задача на рассылку — пользователь создаёт, воркер выполняет."""
     __tablename__ = "tasks"
 
     id: Mapped[int]           = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -169,8 +178,8 @@ class Task(Base):
     name: Mapped[str]         = mapped_column(String(128), default="Задача")
     message: Mapped[str]      = mapped_column(Text)
 
-    photo_file_ids: Mapped[str] = mapped_column(Text, default="[]")
-    format_entities: Mapped[str] = mapped_column(Text, default="[]")
+    photo_file_ids: Mapped[str]   = mapped_column(Text, default="[]")
+    format_entities: Mapped[str]  = mapped_column(Text, default="[]")
 
     interval_minutes: Mapped[int] = mapped_column(Integer, default=60)
 
@@ -184,26 +193,24 @@ class Task(Base):
 
 
 class TaskChat(Base):
-    """Один чат в задаче рассылки."""
     __tablename__ = "task_chats"
 
-    id: Mapped[int]           = mapped_column(Integer, primary_key=True, autoincrement=True)
-    task_id: Mapped[int]      = mapped_column(Integer, ForeignKey("tasks.id"))
-    chat_id: Mapped[str]      = mapped_column(String(64))
-    chat_title: Mapped[str]   = mapped_column(String(128), default="")
-    is_ok: Mapped[bool]       = mapped_column(Boolean, default=True)
+    id: Mapped[int]      = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[int] = mapped_column(Integer, ForeignKey("tasks.id"))
+    chat_id: Mapped[str] = mapped_column(String(64))
+    chat_title: Mapped[str] = mapped_column(String(128), default="")
+    is_ok: Mapped[bool]  = mapped_column(Boolean, default=True)
 
     task: Mapped["Task"] = relationship(back_populates="chats")
 
 
 class TaskAccount(Base):
-    """Связь задача ↔ аккаунт."""
     __tablename__ = "task_accounts"
 
-    id: Mapped[int]      = mapped_column(Integer, primary_key=True, autoincrement=True)
-    task_id: Mapped[int] = mapped_column(Integer, ForeignKey("tasks.id"))
+    id: Mapped[int]         = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[int]    = mapped_column(Integer, ForeignKey("tasks.id"))
     account_id: Mapped[int] = mapped_column(Integer, ForeignKey("accounts.id"))
-    chat_ids: Mapped[str] = mapped_column(Text, default="")
+    chat_ids: Mapped[str]   = mapped_column(Text, default="")
 
     task: Mapped["Task"]       = relationship(back_populates="accounts")
     account: Mapped["Account"] = relationship(back_populates="task_links")
@@ -214,7 +221,6 @@ class TaskAccount(Base):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Payment(Base):
-    """Запись о платеже."""
     __tablename__ = "payments"
 
     id: Mapped[int]          = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -236,13 +242,12 @@ class Payment(Base):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Log(Base):
-    """Лог отправок."""
     __tablename__ = "logs"
 
-    id: Mapped[int]         = mapped_column(Integer, primary_key=True, autoincrement=True)
-    task_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("tasks.id"), nullable=True)
+    id: Mapped[int]              = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[int | None]  = mapped_column(Integer, ForeignKey("tasks.id"), nullable=True)
     account_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("accounts.id"), nullable=True)
-    chat_id: Mapped[str]    = mapped_column(String(64))
-    success: Mapped[bool]   = mapped_column(Boolean)
-    error: Mapped[str | None] = mapped_column(Text)
+    chat_id: Mapped[str]         = mapped_column(String(64))
+    success: Mapped[bool]        = mapped_column(Boolean)
+    error: Mapped[str | None]    = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
