@@ -63,3 +63,4 @@ _shard_max = os.getenv("MIRROR_SHARD_MAX")
 MIRROR_SHARD_MIN: int | None = int(_shard_min) if _shard_min else None
 MIRROR_SHARD_MAX: int | None = int(_shard_max) if _shard_max else None
 MIRROR_RESTART_DELAY = int(os.getenv("MIRROR_RESTART_DELAY", "10"))
+MEDIA_BOT_TOKEN = os.getenv("MEDIA_BOT_TOKEN", BOT_TOKEN)
