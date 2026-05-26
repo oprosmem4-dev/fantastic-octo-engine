@@ -1,10 +1,11 @@
 """
 services/task_service.py — управление задачами рассылок.
 
-ИСПРАВЛЕНИЯ:
-  - _normalize_chat_id: убирает двойной @@ из chat_id перед сохранением
-  - stored_title: больше не добавляет @ если он уже есть в title
-  - chat_id нормализуется перед сохранением в TaskChat и TaskAccount
+ИЗМЕНЕНИЯ (медиа-рефакторинг):
+  - create_task принимает photo_bytes_list: list[bytes] вместо photo_file_ids
+  - Байты сохраняются в таблицу TaskMedia (по одной строке на фото)
+  - Task.has_media = True если есть фото
+  - Остальная логика без изменений
 """
 import json
 import logging
@@ -14,33 +15,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 
 from config import MAX_CHATS_PER_USER
-from models import Task, TaskChat, TaskAccount, Account, User, Log
+from models import Task, TaskChat, TaskAccount, TaskMedia, Account, User, Log
 
 log = logging.getLogger(__name__)
 
 
 def _normalize_chat_id(chat_id: str) -> str:
-    """
-    Нормализовать chat_id:
-      @@username   → @username
-      @username    → @username  (без изменений)
-      -1001234567  → -1001234567 (без изменений)
-    """
     s = str(chat_id).strip()
     if s.startswith("@"):
-        # убираем все лишние @ в начале, оставляем ровно один
         username = s.lstrip("@")
         return f"@{username}"
     return s
 
 
 def _make_stored_title(username: str | None, title: str | None, chat_id: str) -> str:
-    """
-    Сформировать chat_title для хранения в БД.
-    Правила:
-      - есть username → "@username" (ровно один @)
-      - нет username  → title как есть, или str(chat_id) если title пустой
-    """
     if username:
         clean = username.lstrip("@")
         return f"@{clean}"
@@ -82,14 +70,15 @@ async def create_task(
     interval_minutes: int,
     chats: list[dict],
     preferred_account_id: int | None = None,
-    photo_file_ids: list[str] | None = None,
+    photo_bytes_list: list[bytes] | None = None,
     format_entities: list[dict] | None = None,
 ) -> dict | None:
     """
     Создать задачу.
     Возвращает dict (не ORM) чтобы избежать MissingGreenlet после commit.
 
-    chats — список dict с ключами: id, title, username (опционально).
+    photo_bytes_list — список байт фото (каждый элемент = одно фото).
+    Сохраняются в TaskMedia. Удаляются воркером после первой успешной отправки.
     """
     existing_tasks = await get_tasks(db, user.id)
     current_chats  = sum(len(t.chats) for t in existing_tasks)
@@ -98,27 +87,41 @@ async def create_task(
         log.warning("Пользователь %d превысил лимит чатов", user.id)
         return None
 
+    has_media = bool(photo_bytes_list)
+
     task = Task(
         user_id=user.id,
         name=name,
         message=message,
-        photo_file_ids=json.dumps(photo_file_ids or [], ensure_ascii=False),
         format_entities=json.dumps(format_entities or [], ensure_ascii=False),
         interval_minutes=interval_minutes,
+        has_media=has_media,
     )
     db.add(task)
-    await db.flush()
+    await db.flush()  # получаем task.id
 
+    # Сохраняем байты фото в TaskMedia
+    if photo_bytes_list:
+        for idx, photo_bytes in enumerate(photo_bytes_list):
+            db.add(TaskMedia(
+                task_id=task.id,
+                index=idx,
+                data=photo_bytes,
+                mime="image/jpeg",
+            ))
+        log.info("Задача %d: сохранено %d фото в TaskMedia", task.id, len(photo_bytes_list))
+
+    # Сохраняем чаты
     for chat in chats:
-        raw_id   = str(chat["id"])
-        norm_id  = _normalize_chat_id(raw_id)           # убираем @@
-        username = chat.get("username")
-        title    = chat.get("title") or ""
+        raw_id       = str(chat["id"])
+        norm_id      = _normalize_chat_id(raw_id)
+        username     = chat.get("username")
+        title        = chat.get("title") or ""
         stored_title = _make_stored_title(username, title, norm_id)
 
         db.add(TaskChat(
             task_id=task.id,
-            chat_id=norm_id,          # храним нормализованный ID
+            chat_id=norm_id,
             chat_title=stored_title,
         ))
 
@@ -130,6 +133,7 @@ async def create_task(
         "name":             name,
         "chats_count":      len(chats),
         "interval_minutes": interval_minutes,
+        "has_media":        has_media,
     }
 
 
@@ -159,11 +163,7 @@ async def _distribute_chats(
     chats: list[dict],
     preferred_account_id: int | None = None,
 ):
-    """
-    Распределить чаты по аккаунтам.
-    chat_id нормализуется перед записью в TaskAccount.chat_ids.
-    """
-    # Нормализуем все chat_id перед сохранением
+    """Распределить чаты по аккаунтам."""
     chat_ids = [_normalize_chat_id(str(c["id"])) for c in chats]
 
     if preferred_account_id is not None:
@@ -192,7 +192,7 @@ async def _distribute_chats(
         log.info("Задача %d: %d чатов → %s (личный)", task.id, len(chat_ids), acc.phone)
         return
 
-    # Системные аккаунты — round-robin
+    # Системные аккаунты — round-robin по наименее загруженному
     result = await db.execute(
         select(Account).where(
             Account.is_active == True,
@@ -203,7 +203,7 @@ async def _distribute_chats(
     )
     system_accounts = list(result.scalars().all())
 
-    # Fallback на личные аккаунты пользователя если системных нет
+    # Fallback на личные аккаунты пользователя
     if not system_accounts:
         result = await db.execute(
             select(Account).where(
@@ -233,7 +233,7 @@ async def _distribute_chats(
                  task.id, len(chat_ids), acc.phone)
         return
 
-    # Несколько системных — round-robin по наименее загруженному
+    # Round-robin
     distribution: dict[int, list[str]] = {acc.id: [] for acc in system_accounts}
 
     for cid in chat_ids:
