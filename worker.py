@@ -1,19 +1,16 @@
 """
 worker/worker.py — воркер рассылок.
 
-ИЗМЕНЕНИЯ:
-  - Пул Telethon-клиентов: клиенты создаются один раз и остаются подключёнными.
-    Нет connect/disconnect на каждую отправку → аккаунты выглядят как живые.
-  - Rate limiter на уровне аккаунта: asyncio.Semaphore(1) + минимальный
-    cooldown MIN_SEND_INTERVAL секунд между отправками одного аккаунта.
-  - Мгновенная замена аккаунта при ошибке отправки: если сообщение не ушло
-    из-за бана/заморозки/forbidden — сразу ищем другой системный аккаунт и
-    отправляем через него. Пользователь не замечает перерыва.
-  - Тестовая отправка "." убрана везде — первая реальная отправка пользователя
-    является и проверкой доступа. При ошибке → мгновенная замена.
-  - sends_last_hour: при каждой отправке инкрементируется счётчик аккаунта.
-    Каждый час — сброс. При sync_tasks учитывается при балансировке.
-  - Keepalive job каждые 5 минут: проверяет живость клиентов в пуле.
+ИЗМЕНЕНИЯ (медиа-рефакторинг):
+  - _get_media_for_send(): главная функция получения медиа для отправки.
+    1. Проверяет кеш TaskMediaCache для данного аккаунта
+    2. Если кеш есть — возвращает список file_id (строки) → отправка через send_file(file_id)
+    3. Если кеша нет — читает байты из TaskMedia → send_file(BytesIO)
+       → получает Telethon Document из отправленного сообщения
+       → сохраняет file_id в TaskMediaCache
+       → удаляет строки TaskMedia (байты больше не нужны)
+  - _send_with_client(): использует _get_media_for_send() вместо Bot API скачивания
+  - Убраны _download_photos(), _download_photos_via_telethon() — больше не нужны
 """
 import asyncio
 import io
@@ -24,7 +21,7 @@ import time
 from datetime import datetime, timezone, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from telethon.errors import (
@@ -39,28 +36,25 @@ from aiogram import Bot
 
 from config import BOT_TOKEN, MIN_SEND_INTERVAL
 from database import SessionLocal, create_all_tables
-from models import Task, TaskAccount, Account, Log
+from models import Task, TaskAccount, TaskMedia, TaskMediaCache, Account, Log
 from services.account_service import make_client
 
 log = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler(timezone="UTC")
 
-# ── Пул клиентов ─────────────────────────────────────────────────────────────
-# account_id → TelegramClient (постоянное подключение)
+# ── Пул клиентов ──────────────────────────────────────────────────────────────
 _client_pool: dict[int, object] = {}
 _pool_lock = asyncio.Lock()
 
-# ── Rate limiter ──────────────────────────────────────────────────────────────
-# account_id → asyncio.Semaphore(1)  (одна отправка за раз с этого аккаунта)
+# ── Rate limiter ───────────────────────────────────────────────────────────────
 _account_semaphores: dict[int, asyncio.Semaphore] = {}
-# account_id → monotonic time последней отправки
-_account_last_send: dict[int, float] = {}
+_account_last_send:  dict[int, float] = {}
 
 # ── Отслеживание jobs ─────────────────────────────────────────────────────────
 _loaded_jobs: dict[str, int] = {}
 
-# ── zero-width символы для невидимой рандомизации ────────────────────────────
+# ── zero-width символы для невидимой рандомизации ─────────────────────────────
 _ZW_CHARS = ['\u200b', '\u200c', '\u200d']
 
 
@@ -72,19 +66,14 @@ def _randomize_text(text: str) -> str:
     return text[:pos] + char + text[pos:]
 
 
-# ── Пул клиентов: управление ─────────────────────────────────────────────────
+# ── Пул клиентов: управление ──────────────────────────────────────────────────
 
 async def get_client(account: Account):
-    """
-    Вернуть подключённый Telethon-клиент из пула.
-    Если клиента нет или он отвалился — создать новый.
-    """
     async with _pool_lock:
         client = _client_pool.get(account.id)
         if client is not None and client.is_connected():
             return client
 
-        # Создаём / переподключаем
         if client is not None:
             try:
                 await client.disconnect()
@@ -113,7 +102,6 @@ async def get_client(account: Account):
 
 
 async def remove_client(account_id: int):
-    """Убрать клиент из пула (при бане/заморозке)."""
     async with _pool_lock:
         client = _client_pool.pop(account_id, None)
         if client:
@@ -124,18 +112,18 @@ async def remove_client(account_id: int):
 
 
 async def keepalive_clients():
-    """
-    Каждые 5 минут проверяет все клиенты в пуле.
-    Отвалившиеся — реконнектит или удаляет.
-    """
     async with _pool_lock:
         dead = [aid for aid, c in _client_pool.items() if not c.is_connected()]
 
     for aid in dead:
         async with SessionLocal() as db:
             result = await db.execute(
-                select(Account).where(Account.id == aid, Account.is_active == True,
-                                      Account.is_banned == False, Account.status == "ok")
+                select(Account).where(
+                    Account.id == aid,
+                    Account.is_active == True,
+                    Account.is_banned == False,
+                    Account.status == "ok",
+                )
             )
             acc = result.scalar_one_or_none()
         if acc:
@@ -146,7 +134,7 @@ async def keepalive_clients():
                 _client_pool.pop(aid, None)
 
 
-# ── Rate limiter ──────────────────────────────────────────────────────────────
+# ── Rate limiter ───────────────────────────────────────────────────────────────
 
 def _get_semaphore(account_id: int) -> asyncio.Semaphore:
     if account_id not in _account_semaphores:
@@ -155,7 +143,6 @@ def _get_semaphore(account_id: int) -> asyncio.Semaphore:
 
 
 async def _wait_rate_limit(account_id: int):
-    """Ждать MIN_SEND_INTERVAL секунд с момента последней отправки этого аккаунта."""
     last = _account_last_send.get(account_id, 0)
     wait = MIN_SEND_INTERVAL - (time.monotonic() - last)
     if wait > 0:
@@ -166,10 +153,9 @@ def _mark_sent(account_id: int):
     _account_last_send[account_id] = time.monotonic()
 
 
-# ── Счётчик отправок (для балансировки) ──────────────────────────────────────
+# ── Счётчик отправок ───────────────────────────────────────────────────────────
 
 async def _increment_sends(db: AsyncSession, account: Account):
-    """Инкрементировать счётчик отправок, сбрасывать раз в час."""
     now = datetime.now(timezone.utc)
     if account.sends_reset_at is None or (now - account.sends_reset_at).total_seconds() > 3600:
         account.sends_last_hour = 0
@@ -178,7 +164,6 @@ async def _increment_sends(db: AsyncSession, account: Account):
 
 
 async def reset_sends_counters():
-    """Cron каждый час: сбросить sends_last_hour у всех аккаунтов."""
     async with SessionLocal() as db:
         result = await db.execute(select(Account))
         accounts = result.scalars().all()
@@ -189,13 +174,148 @@ async def reset_sends_counters():
     log.info("Счётчики sends_last_hour сброшены.")
 
 
-# ── Синхронизация планировщика ────────────────────────────────────────────────
+# ── Медиа: получить данные для отправки ───────────────────────────────────────
+
+async def _get_media_for_send(
+    db: AsyncSession,
+    task_id: int,
+    account_id: int,
+) -> tuple[list, bool]:
+    """
+    Вернуть медиа-данные для отправки.
+
+    Алгоритм:
+      1. Смотрим кеш TaskMediaCache для этого (task_id, account_id).
+         Если есть — возвращаем список file_id строк. is_cached=True.
+      2. Если кеша нет — читаем байты из TaskMedia.
+         Возвращаем список BytesIO объектов. is_cached=False.
+
+    Возвращает: (media_list, is_cached)
+      - media_list: [] если нет медиа
+      - is_cached=True  → элементы это строки file_id (Telethon)
+      - is_cached=False → элементы это BytesIO объекты
+    """
+    # Проверяем кеш
+    result = await db.execute(
+        select(TaskMediaCache)
+        .where(
+            TaskMediaCache.task_id == task_id,
+            TaskMediaCache.account_id == account_id,
+        )
+        .order_by(TaskMediaCache.index)
+    )
+    cache_rows = result.scalars().all()
+
+    if cache_rows:
+        return [row.file_id for row in cache_rows], True
+
+    # Кеша нет — читаем байты
+    result = await db.execute(
+        select(TaskMedia)
+        .where(TaskMedia.task_id == task_id)
+        .order_by(TaskMedia.index)
+    )
+    media_rows = result.scalars().all()
+
+    if not media_rows:
+        return [], False
+
+    bufs = []
+    for row in media_rows:
+        buf = io.BytesIO(row.data)
+        buf.name = f"photo_{row.index}.jpg"
+        bufs.append(buf)
+
+    return bufs, False
+
+
+async def _save_media_cache_and_cleanup(
+    db: AsyncSession,
+    task_id: int,
+    account_id: int,
+    sent_messages,  # результат client.send_file() — одно сообщение или список
+):
+    """
+    После успешной отправки байт:
+      1. Извлекаем file_id из отправленных сообщений
+      2. Сохраняем в TaskMediaCache
+      3. Удаляем строки из TaskMedia
+
+    sent_messages может быть одним сообщением или списком (медиагруппа).
+    """
+    if not isinstance(sent_messages, (list, tuple)):
+        sent_messages = [sent_messages]
+
+    for idx, msg in enumerate(sent_messages):
+        # Получаем file_id из документа или фото
+        file_id = None
+        if hasattr(msg, "media") and msg.media:
+            media = msg.media
+            if hasattr(media, "document") and media.document:
+                # Сохраняем как строку id + access_hash чтобы Telethon мог резолвить
+                doc = media.document
+                file_id = f"doc:{doc.id}:{doc.access_hash}:{doc.file_reference.hex()}"
+            elif hasattr(media, "photo") and media.photo:
+                photo = media.photo
+                # Берём наибольший размер
+                sizes = getattr(photo, "sizes", [])
+                if sizes:
+                    biggest = max(
+                        (s for s in sizes if hasattr(s, "size")),
+                        key=lambda s: getattr(s, "size", 0),
+                        default=sizes[-1],
+                    )
+                    file_id = f"photo:{photo.id}:{photo.access_hash}:{photo.file_reference.hex()}:{biggest.type}"
+
+        if file_id:
+            db.add(TaskMediaCache(
+                task_id=task_id,
+                account_id=account_id,
+                index=idx,
+                file_id=file_id,
+            ))
+
+    # Удаляем байты из TaskMedia — они больше не нужны
+    await db.execute(
+        delete(TaskMedia).where(TaskMedia.task_id == task_id)
+    )
+    log.info("Задача %d: байты фото удалены из TaskMedia, кеш сохранён для acc=%d",
+             task_id, account_id)
+
+
+async def _telethon_file_from_cache(client, file_id_str: str):
+    """
+    Преобразовать строку кеша обратно в объект который Telethon может отправить.
+    Форматы:
+      doc:id:access_hash:file_reference_hex
+      photo:id:access_hash:file_reference_hex:thumb_type
+    """
+    try:
+        parts = file_id_str.split(":")
+        kind = parts[0]
+
+        if kind == "doc":
+            _, doc_id, access_hash, file_ref_hex = parts
+            return tl_types.InputDocument(
+                id=int(doc_id),
+                access_hash=int(access_hash),
+                file_reference=bytes.fromhex(file_ref_hex),
+            )
+        elif kind == "photo":
+            _, photo_id, access_hash, file_ref_hex, thumb_type = parts
+            return tl_types.InputPhoto(
+                id=int(photo_id),
+                access_hash=int(access_hash),
+                file_reference=bytes.fromhex(file_ref_hex),
+            )
+    except Exception as e:
+        log.warning("Не удалось восстановить file_id из кеша '%s': %s", file_id_str[:40], e)
+    return None
+
+
+# ── Синхронизация планировщика ─────────────────────────────────────────────────
 
 async def sync_tasks():
-    """
-    Каждые 30 сек читает активные задачи из БД и синхронизирует APScheduler.
-    Единица планирования — (task_id, account_id, chat_id).
-    """
     async with SessionLocal() as db:
         result = await db.execute(
             select(Task)
@@ -218,14 +338,12 @@ async def sync_tasks():
                     job_id = _make_job_id(task.id, ta.account_id, chat_id)
                     desired_jobs[job_id] = (task.id, ta.account_id, chat_id, task.interval_minutes)
 
-        # Удаляем лишние jobs
         for job_id in list(_loaded_jobs.keys()):
             if job_id not in desired_jobs:
                 if scheduler.get_job(job_id):
                     scheduler.remove_job(job_id)
                 del _loaded_jobs[job_id]
 
-        # Добавляем новые / обновляем интервалы
         for job_id, (task_id, account_id, chat_id, interval) in desired_jobs.items():
             existing_interval = _loaded_jobs.get(job_id)
             if existing_interval is None:
@@ -249,14 +367,9 @@ def _make_job_id(task_id: int, account_id: int, chat_id: str) -> str:
     return f"chat_{task_id}_{account_id}_{safe}"
 
 
-# ── Основной job: отправка в один чат ────────────────────────────────────────
+# ── Основной job ───────────────────────────────────────────────────────────────
 
 async def send_chat_job(task_id: int, account_id: int, chat_id: str):
-    """
-    Отправляет сообщение в один чат.
-    При ошибке доступа — мгновенно ищет замену среди системных аккаунтов
-    и отправляет через неё. Пользователь не замечает перерыва.
-    """
     async with SessionLocal() as db:
         result = await db.execute(
             select(Task)
@@ -272,31 +385,27 @@ async def send_chat_job(task_id: int, account_id: int, chat_id: str):
         )
         account = result.scalar_one_or_none()
         if not account or not account.is_active or account.is_banned or account.status != "ok":
-            # Основной аккаунт недоступен — пробуем найти замену сразу
             await _try_failover(db, task, account_id, chat_id)
             return
 
-        # Данные сообщения
         message_text = task.message or ""
-        try:
-            photo_file_ids   = json.loads(task.photo_file_ids or "[]")
-        except Exception:
-            photo_file_ids   = []
-        try:
-            format_entities  = json.loads(task.format_entities or "[]")
-        except Exception:
-            format_entities  = []
+        has_media    = task.has_media
 
-    # Rate limiting: одна отправка за раз с этого аккаунта + cooldown
+        try:
+            format_entities = json.loads(task.format_entities or "[]")
+        except Exception:
+            format_entities = []
+
     sem = _get_semaphore(account_id)
     async with sem:
         await _wait_rate_limit(account_id)
 
         client = await get_client(account)
         if client is None:
-            # Клиент недоступен — failover
             async with SessionLocal() as db:
-                result = await db.execute(select(Task).options(selectinload(Task.user)).where(Task.id == task_id))
+                result = await db.execute(
+                    select(Task).options(selectinload(Task.user)).where(Task.id == task_id)
+                )
                 task = result.scalar_one_or_none()
                 if task:
                     await _try_failover(db, task, account_id, chat_id)
@@ -304,7 +413,7 @@ async def send_chat_job(task_id: int, account_id: int, chat_id: str):
 
         success, error, need_failover = await _send_with_client(
             client, account, task_id, chat_id,
-            message_text, photo_file_ids, format_entities,
+            message_text, has_media, format_entities,
         )
 
         _mark_sent(account_id)
@@ -322,7 +431,6 @@ async def send_chat_job(task_id: int, account_id: int, chat_id: str):
                 await _increment_sends(db, account)
                 await db.commit()
 
-                # Перепланируем с новым random offset
                 random_offset = random.randint(0, 90)
                 job_id = _make_job_id(task_id, account_id, chat_id)
                 if scheduler.get_job(job_id):
@@ -346,7 +454,7 @@ async def send_chat_job(task_id: int, account_id: int, chat_id: str):
                         await _try_failover(db, task, account_id, chat_id, error)
 
 
-# ── Отправка через клиент ─────────────────────────────────────────────────────
+# ── Отправка через клиент ──────────────────────────────────────────────────────
 
 async def _send_with_client(
     client,
@@ -354,62 +462,119 @@ async def _send_with_client(
     task_id: int,
     chat_id: str,
     message_text: str,
-    photo_file_ids: list[str],
+    has_media: bool,
     entities_json: list[dict],
 ) -> tuple[bool, str | None, bool]:
+    """
+    Отправить сообщение в один чат.
+
+    Логика медиа:
+      1. Если has_media=False — отправляем только текст.
+      2. Проверяем кеш TaskMediaCache для этого аккаунта.
+         - Кеш есть → строим InputPhoto/InputDocument → send_file() без загрузки байт.
+         - Кеша нет → читаем байты из TaskMedia → send_file(BytesIO)
+           → сохраняем кеш → удаляем байты из TaskMedia.
+    """
     send_text = _randomize_text(message_text)
-    entities = _to_telethon_entities(entities_json)
+    entities  = _to_telethon_entities(entities_json)
 
     try:
         entity = await _resolve_entity(client, chat_id)
         if entity is None:
             return False, "entity_not_found", False
 
-        if photo_file_ids:
-            # Скачиваем через Telethon напрямую, не через Bot API
-            photo_bytes = await _download_photos_via_telethon(client, photo_file_ids)
-            
-            if not photo_bytes:
-                # Fallback: отправить только текст если фото не загрузились
-                log.warning("Не удалось загрузить фото для task=%d, отправляем только текст", task_id)
-                await client.send_message(entity, send_text or "", formatting_entities=entities or None)
-            elif len(photo_bytes) == 1:
-                photo_bytes[0].seek(0)
-                await client.send_file(entity, file=photo_bytes[0], caption=send_text or "",
-                                       formatting_entities=entities or None)
-            else:
-                for buf in photo_bytes:
-                    buf.seek(0)
-                await client.send_file(entity, file=photo_bytes, caption=send_text or "",
-                                       formatting_entities=entities or None)
-        else:
-            await client.send_message(entity, send_text or "", formatting_entities=entities or None)
+        if not has_media:
+            # Только текст
+            await client.send_message(
+                entity, send_text or "",
+                formatting_entities=entities or None,
+            )
+            return True, None, False
 
-        return True, None, False
+        # ── Медиа: получаем данные для отправки ──────────────────────────────
+        async with SessionLocal() as db:
+            media_list, is_cached = await _get_media_for_send(db, task_id, account.id)
+
+        if not media_list:
+            # Медиа нет (байты удалены, кеш тоже пуст) — отправляем только текст
+            log.warning("Задача %d: медиа не найдено, отправляем только текст", task_id)
+            await client.send_message(
+                entity, send_text or "",
+                formatting_entities=entities or None,
+            )
+            return True, None, False
+
+        if is_cached:
+            # ── Кеш есть: строим Telethon-объекты из строк кеша ──────────────
+            tl_files = []
+            for file_id_str in media_list:
+                tl_obj = await _telethon_file_from_cache(client, file_id_str)
+                if tl_obj:
+                    tl_files.append(tl_obj)
+
+            if not tl_files:
+                # Кеш испорчен — отправляем текст
+                log.warning("Задача %d: кеш file_id не удалось восстановить", task_id)
+                await client.send_message(
+                    entity, send_text or "",
+                    formatting_entities=entities or None,
+                )
+                return True, None, False
+
+            if len(tl_files) == 1:
+                await client.send_file(
+                    entity, file=tl_files[0],
+                    caption=send_text or "",
+                    formatting_entities=entities or None,
+                )
+            else:
+                await client.send_file(
+                    entity, file=tl_files,
+                    caption=send_text or "",
+                    formatting_entities=entities or None,
+                )
+            return True, None, False
+
+        else:
+            # ── Кеша нет: первая отправка через байты ────────────────────────
+            # Сбрасываем позицию BytesIO перед отправкой
+            for buf in media_list:
+                buf.seek(0)
+
+            if len(media_list) == 1:
+                sent = await client.send_file(
+                    entity, file=media_list[0],
+                    caption=send_text or "",
+                    formatting_entities=entities or None,
+                )
+            else:
+                sent = await client.send_file(
+                    entity, file=media_list,
+                    caption=send_text or "",
+                    formatting_entities=entities or None,
+                )
+
+            # Сохраняем кеш и удаляем байты
+            async with SessionLocal() as db:
+                await _save_media_cache_and_cleanup(db, task_id, account.id, sent)
+                await db.commit()
+
+            return True, None, False
 
     except FloodWaitError as e:
         wait = min(e.seconds, 60)
-        log.warning("FloodWait %ds для %s в %s — ждём", e.seconds, account.phone, chat_id)
+        log.warning("FloodWait %ds для %s в %s", e.seconds, account.phone, chat_id)
         await asyncio.sleep(wait)
 
-        # Повторная попытка после ожидания
+        # Повтор после ожидания (упрощённый — только текст чтобы не усложнять)
         try:
-            retry_text  = _randomize_text(message_text)
-            photo_retry = []
-            if photo_file_ids:
-                photo_retry = await _download_photos_via_telethon(client, photo_file_ids)
-            entity = await _resolve_entity(client, chat_id)
+            retry_text = _randomize_text(message_text)
+            entity     = await _resolve_entity(client, chat_id)
             if entity:
-                entities = _to_telethon_entities(entities_json)
-                if photo_retry:
-                    for buf in photo_retry:
-                        buf.seek(0)
-                    files = photo_retry if len(photo_retry) > 1 else photo_retry[0]
-                    await client.send_file(entity, file=files, caption=retry_text or "",
-                                           formatting_entities=entities or None)
-                else:
-                    await client.send_message(entity, retry_text or "",
-                                              formatting_entities=entities or None)
+                await client.send_message(
+                    entity, retry_text or "",
+                    formatting_entities=_to_telethon_entities(entities_json) or None,
+                )
                 return True, None, False
         except Exception as retry_e:
             return False, str(retry_e)[:200], False
@@ -417,15 +582,14 @@ async def _send_with_client(
     except (UserBannedInChannelError, ChatWriteForbiddenError) as e:
         err = f"{type(e).__name__}: {e}"
         log.warning("Нет доступа %s → %s: %s", account.phone, chat_id, err)
-        return False, err, True  # ← нужен failover
+        return False, err, True
 
     except (UserDeactivatedError, AuthKeyUnregisteredError) as e:
         err = f"account_frozen: {type(e).__name__}"
         log.error("Аккаунт %s заморожен/деактивирован", account.phone)
-        # Помечаем в БД
         asyncio.create_task(_mark_account_frozen(account.id))
         await remove_client(account.id)
-        return False, err, True  # ← нужен failover
+        return False, err, True
 
     except Exception as e:
         err_str = str(e)
@@ -437,46 +601,10 @@ async def _send_with_client(
         log.error("Ошибка отправки %s → %s: %s", account.phone, chat_id, err_str)
         return False, err_str[:200], is_access_err
 
-async def _download_photos_via_telethon(client, file_ids: list[str]) -> list[io.BytesIO]:
-    """
-    Скачивает фото через Telethon используя InputPhoto из file_id.
-    Работает независимо от того, через какого бота был загружен файл.
-    """
-    if not file_ids:
-        return []
-    
-    # Сначала пробуем через Bot API (быстрее, если file_id от того же бота)
-    bot = Bot(token=BOT_TOKEN)
-    results = []
-    try:
-        for i, file_id in enumerate(file_ids):
-            try:
-                tg_file = await bot.get_file(file_id)
-                buf = io.BytesIO()
-                await bot.download_file(tg_file.file_path, destination=buf)
-                buf.seek(0)
-                buf.name = f"photo_{i}.jpg"
-                results.append(buf)
-            except Exception as e:
-                log.warning("Bot API не смог скачать file_id %s: %s — пробуем через Telethon", file_id[:20], e)
-                # Fallback: попытка через Telethon (работает если клиент видел это фото)
-                try:
-                    from telethon.tl.types import InputPhoto
-                    # Telethon может скачать по file_id если он в правильном формате
-                    buf = io.BytesIO()
-                    # Используем сам file_id как строку — Telethon умеет резолвить
-                    data = await client.download_media(file_id, file=buf)
-                    if data:
-                        buf.seek(0)
-                        buf.name = f"photo_{i}.jpg"
-                        results.append(buf)
-                except Exception as e2:
-                    log.error("Telethon тоже не смог скачать %s: %s", file_id[:20], e2)
-    finally:
-        await bot.session.close()
-    
-    return results
-# ── Мгновенная замена аккаунта (failover) ────────────────────────────────────
+    return False, "unknown", False
+
+
+# ── Failover ───────────────────────────────────────────────────────────────────
 
 async def _try_failover(
     db: AsyncSession,
@@ -485,14 +613,8 @@ async def _try_failover(
     chat_id: str,
     error: str | None = None,
 ):
-    """
-    Ищет другой системный аккаунт и сразу отправляет через него.
-    Перепривязывает чат в БД к новому аккаунту.
-    Уведомляет пользователя только если замена не найдена.
-    """
     from services.restriction_service import handle_chat_restriction
 
-    # Ищем замену: системный аккаунт с наименьшей нагрузкой, у которого есть клиент в пуле
     result = await db.execute(
         select(Account).where(
             Account.is_system == True,
@@ -504,20 +626,18 @@ async def _try_failover(
     )
     candidates = result.scalars().all()
 
-    # Предпочитаем уже подключённых клиентов в пуле (без задержки connect)
     pool_candidates = [c for c in candidates if c.id in _client_pool]
     ordered = pool_candidates + [c for c in candidates if c.id not in pool_candidates]
 
     message_text    = task.message or ""
-    photo_file_ids  = []
+    has_media       = task.has_media
     format_entities = []
     try:
-        photo_file_ids  = json.loads(task.photo_file_ids or "[]")
         format_entities = json.loads(task.format_entities or "[]")
     except Exception:
         pass
 
-    for new_acc in ordered[:5]:  # не перебираем больше 5
+    for new_acc in ordered[:5]:
         client = await get_client(new_acc)
         if client is None:
             continue
@@ -527,21 +647,17 @@ async def _try_failover(
             await _wait_rate_limit(new_acc.id)
             success, err, _ = await _send_with_client(
                 client, new_acc, task.id, chat_id,
-                message_text, photo_file_ids, format_entities,
+                message_text, has_media, format_entities,
             )
             _mark_sent(new_acc.id)
 
         if success:
-            # Перепривязываем чат в БД
             await _reassign_chat(db, task.id, failed_account_id, new_acc.id, chat_id)
             await _increment_sends(db, new_acc)
             await db.commit()
 
-            log.info(
-                "✓ Failover: чат %s переведён с acc#%d на %s (task=%d)",
-                chat_id, failed_account_id, new_acc.phone, task.id,
-            )
-            # Обновляем job в планировщике
+            log.info("✓ Failover: %s → %s (task=%d)", chat_id, new_acc.phone, task.id)
+
             old_job_id = _make_job_id(task.id, failed_account_id, chat_id)
             new_job_id = _make_job_id(task.id, new_acc.id, chat_id)
             interval   = _loaded_jobs.get(old_job_id, task.interval_minutes)
@@ -566,7 +682,6 @@ async def _try_failover(
             await db.commit()
             return
 
-    # Замена не найдена — уведомляем пользователя
     bot = Bot(token=BOT_TOKEN)
     try:
         await handle_chat_restriction(
@@ -590,8 +705,6 @@ async def _reassign_chat(
     new_account_id: int,
     chat_id: str,
 ):
-    """Перепривязать chat_id с одного TaskAccount на другой."""
-    # Убрать из старого
     result = await db.execute(
         select(TaskAccount).where(
             TaskAccount.task_id == task_id,
@@ -607,7 +720,6 @@ async def _reassign_chat(
         else:
             await db.delete(old_ta)
 
-    # Добавить в новый
     result = await db.execute(
         select(TaskAccount).where(
             TaskAccount.task_id == task_id,
@@ -625,7 +737,6 @@ async def _reassign_chat(
         db.add(TA(task_id=task_id, account_id=new_account_id,
                   chat_ids=json.dumps([str(chat_id)])))
 
-    # Обновить chats_count
     result_old = await db.execute(select(Account).where(Account.id == old_account_id))
     acc_old = result_old.scalar_one_or_none()
     if acc_old:
@@ -638,7 +749,6 @@ async def _reassign_chat(
 
 
 async def _mark_account_frozen(account_id: int):
-    """Пометить аккаунт как заморожен в БД."""
     async with SessionLocal() as db:
         result = await db.execute(select(Account).where(Account.id == account_id))
         acc = result.scalar_one_or_none()
@@ -650,28 +760,7 @@ async def _mark_account_frozen(account_id: int):
             log.warning("Аккаунт %s помечен как frozen", acc.phone)
 
 
-# ── Вспомогательные функции ──────────────────────────────────────────────────
-
-async def _download_photos(file_ids: list[str]) -> list[io.BytesIO]:
-    if not file_ids:
-        return []
-    bot = Bot(token=BOT_TOKEN)
-    results = []
-    try:
-        for i, file_id in enumerate(file_ids):
-            try:
-                tg_file = await bot.get_file(file_id)
-                buf = io.BytesIO()
-                await bot.download_file(tg_file.file_path, destination=buf)
-                buf.seek(0)
-                buf.name = f"photo_{i}.jpg"
-                results.append(buf)
-            except Exception as e:
-                log.error("Не удалось скачать file_id %s: %s", file_id[:20], e)
-    finally:
-        await bot.session.close()
-    return results
-
+# ── Вспомогательные функции ────────────────────────────────────────────────────
 
 def _normalize_chat_id(chat_id: str) -> str:
     s = chat_id.strip()
@@ -737,10 +826,9 @@ def _to_telethon_entities(entities_json: list[dict]) -> list:
     return out
 
 
-# ── Фоновые проверки ─────────────────────────────────────────────────────────
+# ── Фоновые проверки ──────────────────────────────────────────────────────────
 
 async def check_accounts():
-    """Каждый час: проверяет авторизацию всех аккаунтов в пуле."""
     async with SessionLocal() as db:
         result = await db.execute(
             select(Account).where(Account.is_active == True, Account.is_banned == False)
@@ -759,7 +847,6 @@ async def check_accounts():
 
 
 async def check_restrictions():
-    """Каждые 30 минут: полная проверка ограничений."""
     try:
         from services.restriction_service import run_full_restriction_check
         await run_full_restriction_check()
@@ -767,10 +854,7 @@ async def check_restrictions():
         log.error("check_restrictions: %s", e)
 
 
-# ── Прогрев пула: подключить все системные аккаунты при старте ───────────────
-
 async def warmup_pool():
-    """При старте воркера — подключить все активные системные аккаунты."""
     async with SessionLocal() as db:
         result = await db.execute(
             select(Account).where(
@@ -785,26 +869,24 @@ async def warmup_pool():
     log.info("Прогрев пула: %d системных аккаунтов...", len(accounts))
     for acc in accounts:
         await get_client(acc)
-        await asyncio.sleep(0.5)  # небольшая пауза между коннектами
+        await asyncio.sleep(0.5)
     log.info("Прогрев пула завершён. Подключено: %d", len(_client_pool))
 
 
-# ── Точка входа ──────────────────────────────────────────────────────────────
+# ── Точка входа ───────────────────────────────────────────────────────────────
 
 async def main():
     await create_all_tables()
-
-    # Прогреваем пул клиентов
     await warmup_pool()
 
-    scheduler.add_job(sync_tasks,          "interval", seconds=30,  id="__sync__")
-    scheduler.add_job(keepalive_clients,   "interval", minutes=5,   id="__keepalive__")
-    scheduler.add_job(check_accounts,      "interval", hours=1,     id="__check_accs__")
-    scheduler.add_job(reset_sends_counters,"interval", hours=1,     id="__reset_sends__")
-    scheduler.add_job(check_restrictions,  "interval", minutes=30,  id="__restrictions__")
+    scheduler.add_job(sync_tasks,           "interval", seconds=30,  id="__sync__")
+    scheduler.add_job(keepalive_clients,    "interval", minutes=5,   id="__keepalive__")
+    scheduler.add_job(check_accounts,       "interval", hours=1,     id="__check_accs__")
+    scheduler.add_job(reset_sends_counters, "interval", hours=1,     id="__reset_sends__")
+    scheduler.add_job(check_restrictions,   "interval", minutes=30,  id="__restrictions__")
 
     scheduler.start()
-    log.info("Воркер запущен (pool + rate-limit + instant failover).")
+    log.info("Воркер запущен.")
 
     await sync_tasks()
 
