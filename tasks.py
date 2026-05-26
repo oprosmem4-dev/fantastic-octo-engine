@@ -1,15 +1,17 @@
 """
 bot/handlers/tasks.py — создание и управление задачами рассылок.
 
-ИСПРАВЛЕНИЯ:
-  - Везде используется parse_mode="HTML" вместо Markdown
-  - Пользовательские данные экранируются через html.escape()
-  - got_task_chats: chat_id нормализуется (убираем @@)
-  - _recode_photo_to_main_bot: при создании задачи в зеркале фото пересылается
-    через основной бот и сохраняется его file_id — воркер всегда скачивает
-    через стабильный BOT_TOKEN независимо от состояния зеркал
+ИЗМЕНЕНИЯ (медиа-рефакторинг):
+  - Фото больше не хранится как file_id.
+  - При создании задачи байты фото скачиваются через Bot API
+    и сохраняются в таблицу TaskMedia (LargeBinary).
+  - Воркер при первой отправке читает байты → отправляет через client.send_file()
+    → кеширует полученный Telethon file_id в TaskMediaCache
+    → удаляет строки из TaskMedia.
+  - При повторных отправках воркер использует кеш (без байт).
 """
 import html
+import io
 import logging
 import json
 from aiogram import Router, F
@@ -20,7 +22,7 @@ from aiogram.types import Message, CallbackQuery
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Any
 
-from models import User
+from models import User, TaskMedia
 from services import task_service, account_service
 from bot.keyboards import (
     kb_tasks, kb_task_detail, kb_task_delete_confirm,
@@ -62,16 +64,8 @@ async def cb_cancel_to_menu(query: CallbackQuery, state: FSMContext, user: User)
 def _normalize_chat_id(raw: str) -> str:
     s = raw.strip()
     if s.startswith("@"):
-        username = s.lstrip("@")
-        return f"@{username}"
+        return f"@{s.lstrip('@')}"
     return s
-
-
-def _chat_display(title: str, username: str | None, link: str | None) -> str:
-    url = f"https://t.me/{username}" if username else link
-    if url:
-        return f'<a href="{url}">{html.escape(title)}</a>'
-    return html.escape(title)
 
 
 def _chat_display_from_task_chat(c) -> str:
@@ -82,44 +76,19 @@ def _chat_display_from_task_chat(c) -> str:
     return html.escape(ct) if ct else html.escape(c.chat_id)
 
 
-async def _recode_photo_to_main_bot(current_bot, file_id: str) -> str:
+async def _download_photo_bytes(bot, file_id: str) -> bytes | None:
     """
-    Пересылает фото через основной бот и возвращает новый file_id привязанный
-    к BOT_TOKEN. Это нужно потому что file_id привязан к конкретному боту:
-    фото загруженное в зеркало нельзя скачать через основной бот.
-
-    Если перекодирование не удалось — возвращает оригинальный file_id
-    (воркер попробует скачать сам, а если не выйдет — отправит только текст).
+    Скачать фото через Bot API и вернуть сырые байты.
+    Возвращает None при ошибке.
     """
-    from config import BOT_TOKEN, OWNER_ID
-    from aiogram import Bot as AiogramBot
-
-    # Уже правильный токен — перекодирование не нужно
-    if current_bot.token == BOT_TOKEN:
-        return file_id
-
     try:
-        main_bot = AiogramBot(token=BOT_TOKEN)
-        try:
-            # Пересылаем фото владельцу через основной бот.
-            # Telegram сам загрузит файл и вернёт новый file_id от этого бота.
-            sent = await main_bot.send_photo(chat_id=OWNER_ID, photo=file_id)
-            # Сразу удаляем чтобы не засорять чат владельца
-            try:
-                await main_bot.delete_message(OWNER_ID, sent.message_id)
-            except Exception:
-                pass
-            new_file_id = sent.photo[-1].file_id
-            log.debug("Фото перекодировано: %s → %s", file_id[:15], new_file_id[:15])
-            return new_file_id
-        finally:
-            await main_bot.session.close()
+        tg_file = await bot.get_file(file_id)
+        buf = io.BytesIO()
+        await bot.download_file(tg_file.file_path, destination=buf)
+        return buf.getvalue()
     except Exception as e:
-        log.warning(
-            "Не удалось перекодировать file_id %s через основной бот: %s — используем оригинал",
-            file_id[:20], e,
-        )
-        return file_id
+        log.error("Не удалось скачать фото file_id=%s: %s", file_id[:20], e)
+        return None
 
 
 # ── Список задач ──────────────────────────────────────────────────────────────
@@ -173,9 +142,10 @@ async def view_task(query: CallbackQuery, state: FSMContext, user: User, db: Asy
         acc_lines.append(f"• {html.escape(acc_name)}: {len(ids)} чатов")
 
     accounts_block = "\n".join(acc_lines) if acc_lines else "—"
+    media_note = " 📷" if task.has_media else ""
 
     text = (
-        f"{icon} <b>{html.escape(task.name)}</b>\n\n"
+        f"{icon} <b>{html.escape(task.name)}</b>{media_note}\n\n"
         f"💬 Сообщение:\n<i>{html.escape(task.message[:200])}</i>\n\n"
         f"⏱ Интервал: каждые {task.interval_minutes} мин.\n"
         f"📬 Чатов: {len(task.chats)}\n"
@@ -282,7 +252,9 @@ async def cmd_new_task(message: Message, state: FSMContext, user: User):
 async def got_task_name(message: Message, state: FSMContext):
     await state.update_data(name=message.text.strip())
     await message.answer(
-        "<b>Шаг 2/4</b> — Введите текст сообщения для рассылки:",
+        "<b>Шаг 2/4</b> — Введите текст сообщения.\n\n"
+        "Можно прикрепить до 5 фото (отправьте как медиагруппу или по одному).\n"
+        "После отправки фото напишите <code>ок</code> чтобы продолжить.",
         reply_markup=kb_cancel(),
         parse_mode="HTML",
     )
@@ -291,56 +263,91 @@ async def got_task_name(message: Message, state: FSMContext):
 
 @router.message(CreateTask.message)
 async def got_task_message(message: Message, state: FSMContext):
+    """
+    Принимаем текст и/или фото.
+    Байты фото скачиваются сразу и сохраняются в FSM-состоянии как список bytes.
+    В БД байты попадут только при финальном создании задачи (confirm_chats).
+    """
     text, entities_json = _extract_text_and_entities(message)
 
-    photo_file_ids: list[str] = []
-    if message.photo:
-        # Перекодируем file_id через основной бот чтобы воркер мог скачать
-        # независимо от того, через какое зеркало создаётся задача
-        recoded = await _recode_photo_to_main_bot(message.bot, message.photo[-1].file_id)
-        photo_file_ids.append(recoded)
+    # ── Одиночное фото ─────────────────────────────────────────────────────
+    if message.photo and not message.media_group_id:
+        photo_bytes = await _download_photo_bytes(message.bot, message.photo[-1].file_id)
+        await state.update_data(
+            message=text,
+            format_entities=entities_json,
+            # храним список байт-объектов как base64 чтобы FSM мог их сериализовать
+            photo_bytes_b64=[_b64(photo_bytes)] if photo_bytes else [],
+        )
+        await message.answer(
+            "<b>Шаг 3/4</b> — Введите интервал в минутах:\n\n"
+            "Минимум: <b>1 минута</b>\n"
+            "⚠️ РЕКОМЕНДУЕМ ОТ 5 ДО 15 минут\n"
+            "Пример: <code>60</code> = каждый час",
+            reply_markup=kb_cancel(),
+            parse_mode="HTML",
+        )
+        await state.set_state(CreateTask.interval)
+        return
 
+    # ── Медиагруппа ────────────────────────────────────────────────────────
     media_group_id = getattr(message, "media_group_id", None)
     if media_group_id:
         data = await state.get_data()
-        mg = data.get("media_group", {"id": media_group_id, "photos": [], "text": "", "entities": []})
+        mg = data.get("media_group", {"id": media_group_id, "photos_b64": [], "text": "", "entities": []})
         if mg.get("id") != media_group_id:
-            mg = {"id": media_group_id, "photos": [], "text": "", "entities": []}
+            mg = {"id": media_group_id, "photos_b64": [], "text": "", "entities": []}
+
         if message.photo:
-            # Перекодируем каждое фото из медиагруппы
-            recoded = await _recode_photo_to_main_bot(message.bot, message.photo[-1].file_id)
-            mg["photos"].append(recoded)
+            if len(mg["photos_b64"]) < 5:
+                photo_bytes = await _download_photo_bytes(message.bot, message.photo[-1].file_id)
+                if photo_bytes:
+                    mg["photos_b64"].append(_b64(photo_bytes))
         if text:
             mg["text"]     = text
             mg["entities"] = entities_json
+
         await state.update_data(media_group=mg)
-        if len(mg["photos"]) > 5:
-            await state.update_data(media_group=None)
-            await message.answer("❌ Максимум 5 фото. Пришлите заново:")
-            return
-        await message.answer(f"📸 Принял фото: {len(mg['photos'])}/5. Добавьте ещё или отправьте 'ок'.")
+        await message.answer(
+            f"📸 Принял фото: {len(mg['photos_b64'])}/5. "
+            "Добавьте ещё или отправьте <code>ок</code> для продолжения.",
+            parse_mode="HTML",
+        )
         return
 
-    if len(photo_file_ids) > 5:
-        await message.answer("❌ Максимум 5 фото.")
-        return
-
+    # ── "ок" после медиагруппы ──────────────────────────────────────────────
     data = await state.get_data()
     mg   = data.get("media_group")
-    if (message.text or "").strip().lower() in {"ок", "ok", "да", "done"} and mg and mg.get("photos"):
+    if (message.text or "").strip().lower() in {"ок", "ok", "да", "done"} and mg and mg.get("photos_b64"):
         text           = mg.get("text", "")
         entities_json  = mg.get("entities", [])
-        photo_file_ids = mg.get("photos", [])  # уже перекодированы ранее
-        await state.update_data(media_group=None)
+        photos_b64     = mg.get("photos_b64", [])
+        await state.update_data(
+            message=text,
+            format_entities=entities_json,
+            photo_bytes_b64=photos_b64,
+            media_group=None,
+        )
+        await message.answer(
+            "<b>Шаг 3/4</b> — Введите интервал в минутах:\n\n"
+            "Минимум: <b>1 минута</b>\n"
+            "⚠️ РЕКОМЕНДУЕМ ОТ 5 ДО 15 минут\n"
+            "Пример: <code>60</code> = каждый час",
+            reply_markup=kb_cancel(),
+            parse_mode="HTML",
+        )
+        await state.set_state(CreateTask.interval)
+        return
 
-    if not text and not photo_file_ids:
-        await message.answer("❌ Пришлите текст или фото (до 5) с подписью.")
+    # ── Только текст ────────────────────────────────────────────────────────
+    if not text:
+        await message.answer("❌ Пришлите текст или фото (до 5 штук) с подписью.")
         return
 
     await state.update_data(
         message=text,
         format_entities=entities_json,
-        photo_file_ids=photo_file_ids,
+        photo_bytes_b64=[],
     )
     await message.answer(
         "<b>Шаг 3/4</b> — Введите интервал в минутах:\n\n"
@@ -377,7 +384,6 @@ async def got_task_chats(message: Message, state: FSMContext, user: User, db: As
     chats = []
 
     if raw.startswith("https://t.me/addlist/"):
-        # ── Папка ─────────────────────────────────────────────────────────────
         await message.answer("🔍 Получаю список чатов из папки...")
 
         accounts = await account_service.get_accounts(db, owner_id=user.id)
@@ -418,12 +424,10 @@ async def got_task_chats(message: Message, state: FSMContext, user: User, db: As
             return
 
     else:
-        # ── Ручной ввод ───────────────────────────────────────────────────────
         for line in raw.splitlines():
             line = line.strip()
             if not line:
                 continue
-
             if line.startswith("@"):
                 username = line.lstrip("@")
                 chat_id  = f"@{username}"
@@ -487,12 +491,14 @@ async def got_sender_choice(query: CallbackQuery, state: FSMContext, user: User,
 
     data  = await state.get_data()
     chats = data.get("chats", [])
+    has_photo = bool(data.get("photo_bytes_b64"))
 
     await query.message.edit_text(
         f"✅ Отправитель: <b>{html.escape(sender_text)}</b>\n\n"
         f"📋 Задача: <b>{html.escape(data['name'])}</b>\n"
         f"📬 Чатов: <b>{len(chats)}</b>\n"
-        f"⏱ Каждые {data['interval']} мин.\n\n"
+        f"⏱ Каждые {data['interval']} мин.\n"
+        f"{'📷 С фото' if has_photo else '📝 Только текст'}\n\n"
         f"Нажмите <b>Продолжить</b> для создания задачи:",
         reply_markup=kb_confirm_chats(),
         parse_mode="HTML",
@@ -584,12 +590,16 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
         )
         return
 
-    await state.clear()
-
     final_chats = [
         {"id": r["id"], "title": r.get("title", ""), "username": r.get("username")}
         for r in accessible
     ]
+
+    # ── Собираем байты фото из FSM ────────────────────────────────────────────
+    photos_b64: list[str] = data.get("photo_bytes_b64", [])
+    photos_bytes: list[bytes] = [_unb64(b) for b in photos_b64 if b]
+
+    await state.clear()
 
     task = await task_service.create_task(
         db, user,
@@ -598,8 +608,8 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
         interval_minutes=data["interval"],
         chats=final_chats,
         preferred_account_id=sender_account_id,
-        photo_file_ids=data.get("photo_file_ids", []),
         format_entities=data.get("format_entities", []),
+        photo_bytes_list=photos_bytes,   # <-- передаём байты напрямую
     )
 
     if not task:
@@ -632,8 +642,10 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
     if len(accessible) > 10:
         preview_lines.append(f"…и ещё {len(accessible) - 10}")
 
+    media_note = " 📷 фото сохранено" if photos_bytes else ""
+
     await query.message.edit_text(
-        f"✅ <b>Задача создана!</b>\n\n"
+        f"✅ <b>Задача создана!</b>{media_note}\n\n"
         f"📋 {html.escape(task['name'])}\n"
         f"📬 Чатов: {task['chats_count']}\n"
         f"⏱ Каждые {task['interval_minutes']} мин.\n\n"
@@ -642,10 +654,22 @@ async def confirm_chats(query: CallbackQuery, state: FSMContext, user: User, db:
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
-    log.info("Создана задача %d для user %d", task["id"], user.id)
+    log.info("Создана задача %d для user %d (фото: %d)", task["id"], user.id, len(photos_bytes))
 
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
+
+import base64
+
+def _b64(data: bytes) -> str:
+    """bytes → base64-строка для хранения в FSM."""
+    return base64.b64encode(data).decode()
+
+
+def _unb64(s: str) -> bytes:
+    """base64-строка → bytes."""
+    return base64.b64decode(s)
+
 
 def _entities_to_json(entities) -> list[dict[str, Any]]:
     if not entities:
