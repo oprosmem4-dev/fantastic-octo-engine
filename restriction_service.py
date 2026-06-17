@@ -1,15 +1,12 @@
 """
 services/restriction_service.py — обнаружение и обработка ограничений на аккаунтах.
 
-ИСПРАВЛЕНИЯ:
-  - _normalize_chat_id: нормализует @@username → @username перед любым использованием
-  - check_chat_access_light: нормализует chat_id на входе
-  - _check_account_chat_access: нормализует chat_id из БД перед проверкой
-  - check_account_on_send_error: нормализует chat_id на входе
-  - handle_chat_restriction: нормализует chat_id на входе
-  - handle_chat_restriction (личный аккаунт): НЕ останавливает всю задачу —
-    убирает только недоступный чат и уведомляет пользователя с кнопкой переноса.
-    Рассылка в остальные чаты продолжается.
+ИЗМЕНЕНИЯ:
+  - _get_bot_for_user(user_id): вместо Bot(token=BOT_TOKEN) ищет зеркало
+    пользователя в БД (MirrorBot) и шлёт через него. Фолбек — BOT_TOKEN.
+  - handle_frozen_account, handle_spamblocked_account, handle_chat_restriction,
+    check_account_on_send_error, run_full_restriction_check — больше не принимают
+    аргумент bot: Bot; каждый сам создаёт правильный бот через _get_bot_for_user.
 """
 import asyncio
 import json
@@ -31,7 +28,7 @@ from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.tl.functions.messages import GetHistoryRequest
 
 from config import OWNER_ID, BOT_TOKEN, SPAMCHECK_USERNAME
-from models import Account, Task, TaskAccount, TaskChat
+from models import Account, Task, TaskAccount, TaskChat, MirrorBot
 from services.account_service import make_client
 
 log = logging.getLogger(__name__)
@@ -40,17 +37,61 @@ _SPAMCHECK_COOLDOWN = 1800  # 30 минут
 _last_spamcheck: dict[int, float] = {}
 
 
-def _get_bot() -> Bot:
+# ─────────────────────────────────────────────────────────────────────────────
+# ПОЛУЧЕНИЕ БОТА ДЛЯ УВЕДОМЛЕНИЯ
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _get_bot_for_user(user_id: int) -> Bot:
+    """
+    Вернуть Bot через который пользователь получит уведомление.
+
+    Цепочка поиска:
+      1. Собственное зеркало пользователя (MirrorBot.user_id == user_id)
+      2. Любое активное зеркало из БД (пользователь работает через чужое/демо-зеркало)
+      3. Фолбек на GENERATOR_BOT_TOKEN / BOT_TOKEN — крайний случай
+
+    Сообщение в любом случае отправляется конкретному user_id,
+    а не всем пользователям бота — Telegram Bot API гарантирует это.
+
+    ВАЖНО: вызывающий код должен закрыть сессию через await bot.session.close().
+    """
+    try:
+        from database import SessionLocal
+        from config import GENERATOR_BOT_TOKEN
+        async with SessionLocal() as db:
+            # 1. Собственное зеркало пользователя
+            result = await db.execute(
+                select(MirrorBot).where(
+                    MirrorBot.user_id == user_id,
+                    MirrorBot.is_active == True,
+                )
+            )
+            mirror = result.scalar_one_or_none()
+            if mirror and mirror.token:
+                log.debug("_get_bot_for_user(%d): используем своё зеркало @%s",
+                          user_id, mirror.bot_username)
+                return Bot(token=mirror.token)
+
+            # 2. Любое активное зеркало
+            result = await db.execute(
+                select(MirrorBot).where(MirrorBot.is_active == True).limit(1)
+            )
+            any_mirror = result.scalar_one_or_none()
+            if any_mirror and any_mirror.token:
+                log.debug("_get_bot_for_user(%d): своего зеркала нет, "
+                          "используем @%s", user_id, any_mirror.bot_username)
+                return Bot(token=any_mirror.token)
+
+        # 3. Фолбек на generator бот (основная точка входа)
+        return Bot(token=GENERATOR_BOT_TOKEN)
+
+    except Exception as e:
+        log.warning("_get_bot_for_user(%d): ошибка поиска зеркала: %s", user_id, e)
+
     return Bot(token=BOT_TOKEN)
 
 
 def _normalize_chat_id(chat_id: str) -> str:
-    """
-    Нормализовать chat_id:
-      @@username  → @username
-      @@@username → @username
-      -100123456  → -100123456  (без изменений)
-    """
     s = str(chat_id).strip()
     if s.startswith("@"):
         username = s.lstrip("@")
@@ -132,6 +173,7 @@ async def is_account_spamblocked(client: TelegramClient) -> bool:
     target = SPAMCHECK_USERNAME.lstrip("@")
     try:
         await client.send_message(target, "check")
+        await client.delete_dialog(target, revoke=False)
         return False
     except FloodWaitError:
         return False
@@ -144,10 +186,6 @@ async def check_chat_access_light(
     client: TelegramClient,
     chat_id: str,
 ) -> tuple[bool, str]:
-    """
-    Лёгкая проверка доступа к чату без тестовой отправки.
-    chat_id нормализуется на входе (@@username → @username).
-    """
     chat_id = _normalize_chat_id(chat_id)
 
     entity = None
@@ -424,7 +462,7 @@ async def remove_chat_from_task(
 # ОБРАБОТЧИКИ ОГРАНИЧЕНИЙ
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def handle_frozen_account(db: AsyncSession, account: Account, bot: Bot):
+async def handle_frozen_account(db: AsyncSession, account: Account):
     if account.status == "frozen":
         return
 
@@ -437,6 +475,7 @@ async def handle_frozen_account(db: AsyncSession, account: Account, bot: Bot):
     stopped = await stop_account_tasks(db, account)
 
     if account.is_system:
+        bot = await _get_bot_for_user(OWNER_ID)
         try:
             await bot.send_message(
                 OWNER_ID,
@@ -450,8 +489,11 @@ async def handle_frozen_account(db: AsyncSession, account: Account, bot: Bot):
             )
         except Exception as e:
             log.error("Ошибка уведомления о заморозке системного: %s", e)
+        finally:
+            await bot.session.close()
     else:
         if account.owner_id:
+            bot = await _get_bot_for_user(account.owner_id)
             try:
                 await bot.send_message(
                     account.owner_id,
@@ -464,9 +506,11 @@ async def handle_frozen_account(db: AsyncSession, account: Account, bot: Bot):
                 )
             except Exception:
                 pass
+            finally:
+                await bot.session.close()
 
 
-async def handle_spamblocked_account(db: AsyncSession, account: Account, bot: Bot):
+async def handle_spamblocked_account(db: AsyncSession, account: Account):
     if account.status == "spamblocked":
         return
 
@@ -476,6 +520,7 @@ async def handle_spamblocked_account(db: AsyncSession, account: Account, bot: Bo
 
     if account.is_system:
         redirected = await redistribute_system_chats(db, account)
+        bot = await _get_bot_for_user(OWNER_ID)
         try:
             await bot.send_message(
                 OWNER_ID,
@@ -489,9 +534,12 @@ async def handle_spamblocked_account(db: AsyncSession, account: Account, bot: Bo
             )
         except Exception as e:
             log.error("Ошибка уведомления о спамблоке системного: %s", e)
+        finally:
+            await bot.session.close()
     else:
         stopped = await stop_account_tasks(db, account)
         if account.owner_id:
+            bot = await _get_bot_for_user(account.owner_id)
             try:
                 await bot.send_message(
                     account.owner_id,
@@ -505,6 +553,8 @@ async def handle_spamblocked_account(db: AsyncSession, account: Account, bot: Bo
                 )
             except Exception:
                 pass
+            finally:
+                await bot.session.close()
 
 
 async def handle_chat_restriction(
@@ -513,12 +563,9 @@ async def handle_chat_restriction(
     task_id: int,
     chat_id: str,
     reason: str,
-    bot: Bot,
 ):
-    # Нормализуем сразу на входе
     chat_id = _normalize_chat_id(chat_id)
 
-    # resolve_failed означает что чат просто не нашли — не останавливаем задачу
     if reason == "resolve_failed":
         log.warning(
             "handle_chat_restriction: reason=resolve_failed для '%s' acc=%s — пропускаем",
@@ -554,47 +601,49 @@ async def handle_chat_restriction(
         # ── Системный аккаунт: ищем замену автоматически ─────────────────────
         new_acc = await find_replacement_system_account(db, account, chat_id)
 
-        if new_acc:
-            await transfer_chat_to_account(db, task, account, new_acc, chat_id)
-            await db.commit()
-            log.info("Чат %s перенесён с %s на %s (задача %d)", chat_id, account.phone, new_acc.phone, task_id)
-            try:
-                await bot.send_message(
-                    task.user_id,
-                    f"🔄 *Автоматическая замена аккаунта в рассылке*\n\n"
-                    f"Задача: *{task.name}*\n"
-                    f"Чат: {chat_title}\n\n"
-                    f"Причина: {reason_text}\n\n"
-                    f"❌ Старый: `{account.phone}`\n"
-                    f"✅ Новый: `{new_acc.phone}`\n\n"
-                    f"Рассылка продолжается автоматически.",
-                    parse_mode="Markdown",
-                )
-            except Exception:
-                pass
-        else:
-            await remove_chat_from_task(db, task, account, chat_id)
-            await db.commit()
-            try:
-                await bot.send_message(
-                    task.user_id,
-                    f"⚠️ *Чат недоступен для рассылки*\n\n"
-                    f"Задача: *{task.name}*\n"
-                    f"Чат: {chat_title}\n"
-                    f"Причина: {reason_text}\n\n"
-                    f"Ни один системный аккаунт не может писать в этот чат.",
-                    parse_mode="Markdown",
-                )
-            except Exception:
-                pass
+        # Уведомление шлём в зеркало владельца задачи
+        notify_user_id = task.user_id
+        bot = await _get_bot_for_user(notify_user_id)
+        try:
+            if new_acc:
+                await transfer_chat_to_account(db, task, account, new_acc, chat_id)
+                await db.commit()
+                log.info("Чат %s перенесён с %s на %s (задача %d)",
+                         chat_id, account.phone, new_acc.phone, task_id)
+                try:
+                    await bot.send_message(
+                        notify_user_id,
+                        f"🔄 *Автоматическая замена аккаунта в рассылке*\n\n"
+                        f"Задача: *{task.name}*\n"
+                        f"Чат: {chat_title}\n\n"
+                        f"Причина: {reason_text}\n\n"
+                        f"❌ Старый: `{account.phone}`\n"
+                        f"✅ Новый: `{new_acc.phone}`\n\n"
+                        f"Рассылка продолжается автоматически.",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+            else:
+                await remove_chat_from_task(db, task, account, chat_id)
+                await db.commit()
+                try:
+                    await bot.send_message(
+                        notify_user_id,
+                        f"⚠️ *Чат недоступен для рассылки*\n\n"
+                        f"Задача: *{task.name}*\n"
+                        f"Чат: {chat_title}\n"
+                        f"Причина: {reason_text}\n\n"
+                        f"Ни один системный аккаунт не может писать в этот чат.",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+        finally:
+            await bot.session.close()
 
     else:
         # ── Личный аккаунт: убираем ТОЛЬКО этот чат, задачу не останавливаем ─
-        #
-        # Раньше здесь было: task.is_active = False
-        # Теперь: удаляем проблемный чат из задачи и уведомляем пользователя.
-        # Рассылка в остальные чаты продолжается без изменений.
-
         await remove_chat_from_task(db, task, account, chat_id)
         await db.commit()
 
@@ -612,7 +661,6 @@ async def handle_chat_restriction(
             if len(msg_preview) > 800:
                 msg_preview = msg_preview[:800] + "…"
 
-            # Считаем сколько чатов осталось в задаче после удаления
             remaining_result = await db.execute(
                 select(TaskAccount).where(TaskAccount.task_id == task_id)
             )
@@ -639,6 +687,7 @@ async def handle_chat_restriction(
                 else "⚠️ Других чатов в задаче не осталось."
             )
 
+            bot = await _get_bot_for_user(account.owner_id)
             try:
                 await bot.send_message(
                     account.owner_id,
@@ -656,6 +705,8 @@ async def handle_chat_restriction(
                 )
             except Exception as e:
                 log.warning("Ошибка отправки уведомления об ограничении: %s", e)
+            finally:
+                await bot.session.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -668,7 +719,6 @@ async def check_account_on_send_error(
     chat_id: str,
     send_error: Exception,
 ):
-    # Нормализуем сразу
     chat_id = _normalize_chat_id(chat_id)
 
     now = time.monotonic()
@@ -680,54 +730,50 @@ async def check_account_on_send_error(
 
     from database import SessionLocal
 
-    bot = _get_bot()
-    try:
-        async with SessionLocal() as db:
-            result = await db.execute(select(Account).where(Account.id == account_id))
-            account = result.scalar_one_or_none()
-            if not account or account.status != "ok":
+    async with SessionLocal() as db:
+        result = await db.execute(select(Account).where(Account.id == account_id))
+        account = result.scalar_one_or_none()
+        if not account or account.status != "ok":
+            return
+
+        client = make_client(account)
+        try:
+            await client.connect()
+            await asyncio.sleep(1)
+
+            if not await client.is_user_authorized():
+                await handle_frozen_account(db, account)
                 return
 
-            client = make_client(account)
+            if await is_account_frozen(client):
+                await handle_frozen_account(db, account)
+                return
+
+            if await is_account_spamblocked(client):
+                await handle_spamblocked_account(db, account)
+                return
+
+            err_name = type(send_error).__name__.lower()
+            err_str = str(send_error).lower()
+
+            if isinstance(send_error, UserBannedInChannelError) or "banned" in err_name + err_str:
+                reason = "banned"
+            elif isinstance(send_error, ChatWriteForbiddenError) or "forbidden" in err_name + err_str:
+                reason = "write_forbidden"
+            elif "participant" in err_str or "kicked" in err_str:
+                reason = "kicked"
+            else:
+                reason = str(send_error)[:60]
+
+            await handle_chat_restriction(db, account, task_id, chat_id, reason)
+
+        except Exception as e:
+            log.error("Ошибка в check_account_on_send_error (acc=%d): %s", account_id, e)
+        finally:
             try:
-                await client.connect()
-                await asyncio.sleep(1)
-
-                if not await client.is_user_authorized():
-                    await handle_frozen_account(db, account, bot)
-                    return
-
-                if await is_account_frozen(client):
-                    await handle_frozen_account(db, account, bot)
-                    return
-
-                if await is_account_spamblocked(client):
-                    await handle_spamblocked_account(db, account, bot)
-                    return
-
-                err_name = type(send_error).__name__.lower()
-                err_str = str(send_error).lower()
-
-                if isinstance(send_error, UserBannedInChannelError) or "banned" in err_name + err_str:
-                    reason = "banned"
-                elif isinstance(send_error, ChatWriteForbiddenError) or "forbidden" in err_name + err_str:
-                    reason = "write_forbidden"
-                elif "participant" in err_str or "kicked" in err_str:
-                    reason = "kicked"
-                else:
-                    reason = str(send_error)[:60]
-
-                await handle_chat_restriction(db, account, task_id, chat_id, reason, bot)
-
-            except Exception as e:
-                log.error("Ошибка в check_account_on_send_error (acc=%d): %s", account_id, e)
-            finally:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-    finally:
-        await bot.session.close()
+                await client.disconnect()
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -738,7 +784,6 @@ async def run_full_restriction_check():
     from database import SessionLocal
 
     log.info("▶️  Запуск периодической проверки ограничений аккаунтов")
-    bot = _get_bot()
 
     try:
         async with SessionLocal() as db:
@@ -753,37 +798,36 @@ async def run_full_restriction_check():
             log.info("Проверка ограничений: %d аккаунтов", len(accounts))
 
             for account in accounts:
-                await _check_single_account(db, account, bot)
+                await _check_single_account(db, account)
                 await asyncio.sleep(3)
 
     except Exception as e:
         log.error("Критическая ошибка проверки ограничений: %s", e)
-    finally:
-        await bot.session.close()
-        log.info("✅  Проверка ограничений завершена")
+
+    log.info("✅  Проверка ограничений завершена")
 
 
-async def _check_single_account(db: AsyncSession, account: Account, bot: Bot):
+async def _check_single_account(db: AsyncSession, account: Account):
     client = make_client(account)
     try:
         await client.connect()
         await asyncio.sleep(1)
 
         if not await client.is_user_authorized():
-            await handle_frozen_account(db, account, bot)
+            await handle_frozen_account(db, account)
             return
 
         if await is_account_frozen(client):
-            await handle_frozen_account(db, account, bot)
+            await handle_frozen_account(db, account)
             return
 
         _last_spamcheck[account.id] = time.monotonic()
 
         if await is_account_spamblocked(client):
-            await handle_spamblocked_account(db, account, bot)
+            await handle_spamblocked_account(db, account)
             return
 
-        await _check_account_chat_access(db, account, client, bot)
+        await _check_account_chat_access(db, account, client)
 
     except Exception as e:
         log.error("Ошибка проверки аккаунта %s (id=%d): %s", account.phone, account.id, e)
@@ -798,7 +842,6 @@ async def _check_account_chat_access(
     db: AsyncSession,
     account: Account,
     client: TelegramClient,
-    bot: Bot,
 ):
     result = await db.execute(
         select(TaskAccount).where(TaskAccount.account_id == account.id)
@@ -818,7 +861,6 @@ async def _check_account_chat_access(
         except Exception:
             continue
 
-        # Нормализуем все chat_id из БД перед проверкой
         chat_ids = [_normalize_chat_id(str(cid)) for cid in raw_chat_ids]
 
         for chat_id in list(chat_ids):
@@ -830,7 +872,7 @@ async def _check_account_chat_access(
                     account.phone, chat_id, reason,
                 )
                 await handle_chat_restriction(
-                    db, account, ta.task_id, chat_id, reason, bot
+                    db, account, ta.task_id, chat_id, reason
                 )
 
             await asyncio.sleep(1)
