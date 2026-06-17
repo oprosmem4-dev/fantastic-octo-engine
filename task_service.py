@@ -1,23 +1,60 @@
 """
 services/task_service.py — управление задачами рассылок.
 
-ИЗМЕНЕНИЯ (медиа-рефакторинг):
-  - create_task принимает photo_bytes_list: list[bytes] вместо photo_file_ids
-  - Байты сохраняются в таблицу TaskMedia (по одной строке на фото)
-  - Task.has_media = True если есть фото
-  - Остальная логика без изменений
+МЕДИА-РЕФАКТОРИНГ (диск вместо БД):
+  - create_task принимает photo_bytes_list: list[bytes]
+  - Байты сохраняются на диск: /app/media/task_{id}/photo_0.jpg, photo_1.jpg, ...
+  - delete_task удаляет папку с медиа вместе с задачей
+  - Никаких TaskMedia / TaskMediaCache в БД
 """
 import json
 import logging
+import os
+import shutil
+from pathlib import Path
 
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 
 from config import MAX_CHATS_PER_USER
-from models import Task, TaskChat, TaskAccount, TaskMedia, Account, User, Log
+from models import Task, TaskChat, TaskAccount, Account, User, Log
 
 log = logging.getLogger(__name__)
+
+MEDIA_ROOT = Path(os.getenv("MEDIA_ROOT", str(Path(__file__).resolve().parent.parent / "media")))
+
+
+def _task_media_dir(task_id: int) -> Path:
+    return MEDIA_ROOT / f"task_{task_id}"
+
+
+def _save_media_to_disk(task_id: int, photo_bytes_list: list[bytes]) -> int:
+    """Сохранить фото задачи на диск. Возвращает кол-во сохранённых файлов."""
+    if not photo_bytes_list:
+        return 0
+    d = _task_media_dir(task_id)
+    d.mkdir(parents=True, exist_ok=True)
+    saved = 0
+    for idx, data in enumerate(photo_bytes_list):
+        try:
+            (d / f"photo_{idx}.jpg").write_bytes(data)
+            saved += 1
+        except Exception as e:
+            log.error("Не удалось сохранить фото %d задачи %d: %s", idx, task_id, e)
+    log.info("Задача %d: сохранено %d/%d фото в %s", task_id, saved, len(photo_bytes_list), d)
+    return saved
+
+
+def _delete_media_from_disk(task_id: int):
+    """Удалить папку с медиа задачи."""
+    d = _task_media_dir(task_id)
+    if d.exists():
+        try:
+            shutil.rmtree(d)
+            log.info("Задача %d: медиа-папка удалена (%s)", task_id, d)
+        except Exception as e:
+            log.error("Не удалось удалить медиа-папку задачи %d: %s", task_id, e)
 
 
 def _normalize_chat_id(chat_id: str) -> str:
@@ -77,8 +114,8 @@ async def create_task(
     Создать задачу.
     Возвращает dict (не ORM) чтобы избежать MissingGreenlet после commit.
 
-    photo_bytes_list — список байт фото (каждый элемент = одно фото).
-    Сохраняются в TaskMedia. Удаляются воркером после первой успешной отправки.
+    photo_bytes_list — список байт фото. Сохраняются на диск в
+    /app/media/task_{id}/photo_N.jpg и читаются оттуда при каждой отправке.
     """
     existing_tasks = await get_tasks(db, user.id)
     current_chats  = sum(len(t.chats) for t in existing_tasks)
@@ -100,17 +137,6 @@ async def create_task(
     db.add(task)
     await db.flush()  # получаем task.id
 
-    # Сохраняем байты фото в TaskMedia
-    if photo_bytes_list:
-        for idx, photo_bytes in enumerate(photo_bytes_list):
-            db.add(TaskMedia(
-                task_id=task.id,
-                index=idx,
-                data=photo_bytes,
-                mime="image/jpeg",
-            ))
-        log.info("Задача %d: сохранено %d фото в TaskMedia", task.id, len(photo_bytes_list))
-
     # Сохраняем чаты
     for chat in chats:
         raw_id       = str(chat["id"])
@@ -128,6 +154,10 @@ async def create_task(
     await _distribute_chats(db, task, user, chats, preferred_account_id=preferred_account_id)
     await db.commit()
 
+    # Сохраняем медиа на диск ПОСЛЕ commit (task.id уже есть)
+    if photo_bytes_list:
+        _save_media_to_disk(task.id, photo_bytes_list)
+
     return {
         "id":               task.id,
         "name":             name,
@@ -144,6 +174,8 @@ async def delete_task(db: AsyncSession, task_id: int, user_id: int) -> bool:
     await db.execute(delete(Log).where(Log.task_id == task_id))
     await db.delete(task)
     await db.commit()
+    # Удаляем медиа с диска после успешного удаления из БД
+    _delete_media_from_disk(task_id)
     return True
 
 
