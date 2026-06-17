@@ -1,27 +1,24 @@
 """
 worker/worker.py — воркер рассылок.
 
-ИЗМЕНЕНИЯ (медиа-рефакторинг):
-  - _get_media_for_send(): главная функция получения медиа для отправки.
-    1. Проверяет кеш TaskMediaCache для данного аккаунта
-    2. Если кеш есть — возвращает список file_id (строки) → отправка через send_file(file_id)
-    3. Если кеша нет — читает байты из TaskMedia → send_file(BytesIO)
-       → получает Telethon Document из отправленного сообщения
-       → сохраняет file_id в TaskMediaCache
-       → удаляет строки TaskMedia (байты больше не нужны)
-  - _send_with_client(): использует _get_media_for_send() вместо Bot API скачивания
-  - Убраны _download_photos(), _download_photos_via_telethon() — больше не нужны
+МЕДИА-РЕФАКТОРИНГ (диск вместо БД+кеша):
+  - Фото хранятся на диске: /app/media/task_{id}/photo_0.jpg, photo_1.jpg, ...
+  - При каждой отправке читаем файлы с диска и передаём BytesIO в send_file()
+  - Никакого кеша file_id, никакого TaskMedia/TaskMediaCache в БД
+  - При удалении задачи task_service удаляет папку с диска
 """
 import asyncio
 import io
 import json
 import logging
+import os
 import random
 import time
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from sqlalchemy import select, delete
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from telethon.errors import (
@@ -36,12 +33,29 @@ from aiogram import Bot
 
 from config import BOT_TOKEN, MIN_SEND_INTERVAL
 from database import SessionLocal, create_all_tables
-from models import Task, TaskAccount, TaskMedia, TaskMediaCache, Account, Log
+from models import Task, TaskAccount, Account, Log
 from services.account_service import make_client
 
 log = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler(timezone="UTC")
+
+# ── Медиа-папка ───────────────────────────────────────────────────────────────
+MEDIA_ROOT = Path(os.getenv("MEDIA_ROOT", str(Path(__file__).resolve().parent.parent / "media")))
+
+
+def _task_media_dir(task_id: int) -> Path:
+    return MEDIA_ROOT / f"task_{task_id}"
+
+
+def _get_task_media_files(task_id: int) -> list[Path]:
+    """Вернуть список файлов медиа задачи, отсортированных по индексу."""
+    d = _task_media_dir(task_id)
+    if not d.exists():
+        return []
+    files = sorted(d.glob("photo_*.jpg"), key=lambda p: int(p.stem.split("_")[1]))
+    return files
+
 
 # ── Пул клиентов ──────────────────────────────────────────────────────────────
 _client_pool: dict[int, object] = {}
@@ -172,145 +186,6 @@ async def reset_sends_counters():
             acc.sends_reset_at  = datetime.now(timezone.utc)
         await db.commit()
     log.info("Счётчики sends_last_hour сброшены.")
-
-
-# ── Медиа: получить данные для отправки ───────────────────────────────────────
-
-async def _get_media_for_send(
-    db: AsyncSession,
-    task_id: int,
-    account_id: int,
-) -> tuple[list, bool]:
-    """
-    Вернуть медиа-данные для отправки.
-
-    Алгоритм:
-      1. Смотрим кеш TaskMediaCache для этого (task_id, account_id).
-         Если есть — возвращаем список file_id строк. is_cached=True.
-      2. Если кеша нет — читаем байты из TaskMedia.
-         Возвращаем список BytesIO объектов. is_cached=False.
-
-    Возвращает: (media_list, is_cached)
-      - media_list: [] если нет медиа
-      - is_cached=True  → элементы это строки file_id (Telethon)
-      - is_cached=False → элементы это BytesIO объекты
-    """
-    # Проверяем кеш
-    result = await db.execute(
-        select(TaskMediaCache)
-        .where(
-            TaskMediaCache.task_id == task_id,
-            TaskMediaCache.account_id == account_id,
-        )
-        .order_by(TaskMediaCache.index)
-    )
-    cache_rows = result.scalars().all()
-
-    if cache_rows:
-        return [row.file_id for row in cache_rows], True
-
-    # Кеша нет — читаем байты
-    result = await db.execute(
-        select(TaskMedia)
-        .where(TaskMedia.task_id == task_id)
-        .order_by(TaskMedia.index)
-    )
-    media_rows = result.scalars().all()
-
-    if not media_rows:
-        return [], False
-
-    bufs = []
-    for row in media_rows:
-        buf = io.BytesIO(row.data)
-        buf.name = f"photo_{row.index}.jpg"
-        bufs.append(buf)
-
-    return bufs, False
-
-
-async def _save_media_cache_and_cleanup(
-    db: AsyncSession,
-    task_id: int,
-    account_id: int,
-    sent_messages,  # результат client.send_file() — одно сообщение или список
-):
-    """
-    После успешной отправки байт:
-      1. Извлекаем file_id из отправленных сообщений
-      2. Сохраняем в TaskMediaCache
-      3. Удаляем строки из TaskMedia
-
-    sent_messages может быть одним сообщением или списком (медиагруппа).
-    """
-    if not isinstance(sent_messages, (list, tuple)):
-        sent_messages = [sent_messages]
-
-    for idx, msg in enumerate(sent_messages):
-        # Получаем file_id из документа или фото
-        file_id = None
-        if hasattr(msg, "media") and msg.media:
-            media = msg.media
-            if hasattr(media, "document") and media.document:
-                # Сохраняем как строку id + access_hash чтобы Telethon мог резолвить
-                doc = media.document
-                file_id = f"doc:{doc.id}:{doc.access_hash}:{doc.file_reference.hex()}"
-            elif hasattr(media, "photo") and media.photo:
-                photo = media.photo
-                # Берём наибольший размер
-                sizes = getattr(photo, "sizes", [])
-                if sizes:
-                    biggest = max(
-                        (s for s in sizes if hasattr(s, "size")),
-                        key=lambda s: getattr(s, "size", 0),
-                        default=sizes[-1],
-                    )
-                    file_id = f"photo:{photo.id}:{photo.access_hash}:{photo.file_reference.hex()}:{biggest.type}"
-
-        if file_id:
-            db.add(TaskMediaCache(
-                task_id=task_id,
-                account_id=account_id,
-                index=idx,
-                file_id=file_id,
-            ))
-
-    # Удаляем байты из TaskMedia — они больше не нужны
-    await db.execute(
-        delete(TaskMedia).where(TaskMedia.task_id == task_id)
-    )
-    log.info("Задача %d: байты фото удалены из TaskMedia, кеш сохранён для acc=%d",
-             task_id, account_id)
-
-
-async def _telethon_file_from_cache(client, file_id_str: str):
-    """
-    Преобразовать строку кеша обратно в объект который Telethon может отправить.
-    Форматы:
-      doc:id:access_hash:file_reference_hex
-      photo:id:access_hash:file_reference_hex:thumb_type
-    """
-    try:
-        parts = file_id_str.split(":")
-        kind = parts[0]
-
-        if kind == "doc":
-            _, doc_id, access_hash, file_ref_hex = parts
-            return tl_types.InputDocument(
-                id=int(doc_id),
-                access_hash=int(access_hash),
-                file_reference=bytes.fromhex(file_ref_hex),
-            )
-        elif kind == "photo":
-            _, photo_id, access_hash, file_ref_hex, thumb_type = parts
-            return tl_types.InputPhoto(
-                id=int(photo_id),
-                access_hash=int(access_hash),
-                file_reference=bytes.fromhex(file_ref_hex),
-            )
-    except Exception as e:
-        log.warning("Не удалось восстановить file_id из кеша '%s': %s", file_id_str[:40], e)
-    return None
 
 
 # ── Синхронизация планировщика ─────────────────────────────────────────────────
@@ -468,12 +343,8 @@ async def _send_with_client(
     """
     Отправить сообщение в один чат.
 
-    Логика медиа:
-      1. Если has_media=False — отправляем только текст.
-      2. Проверяем кеш TaskMediaCache для этого аккаунта.
-         - Кеш есть → строим InputPhoto/InputDocument → send_file() без загрузки байт.
-         - Кеша нет → читаем байты из TaskMedia → send_file(BytesIO)
-           → сохраняем кеш → удаляем байты из TaskMedia.
+    Медиа читается с диска при каждой отправке — просто и надёжно.
+    Файлы: /app/media/task_{task_id}/photo_0.jpg, photo_1.jpg, ...
     """
     send_text = _randomize_text(message_text)
     entities  = _to_telethon_entities(entities_json)
@@ -484,89 +355,63 @@ async def _send_with_client(
             return False, "entity_not_found", False
 
         if not has_media:
-            # Только текст
             await client.send_message(
                 entity, send_text or "",
                 formatting_entities=entities or None,
             )
             return True, None, False
 
-        # ── Медиа: получаем данные для отправки ──────────────────────────────
-        async with SessionLocal() as db:
-            media_list, is_cached = await _get_media_for_send(db, task_id, account.id)
+        # ── Читаем медиа с диска ───────────────────────────────────────────────
+        media_files = _get_task_media_files(task_id)
 
-        if not media_list:
-            # Медиа нет (байты удалены, кеш тоже пуст) — отправляем только текст
-            log.warning("Задача %d: медиа не найдено, отправляем только текст", task_id)
+        if not media_files:
+            # Файлы удалены или не найдены — отправляем только текст
+            log.warning("Задача %d: файлы медиа не найдены на диске, отправляем текст", task_id)
             await client.send_message(
                 entity, send_text or "",
                 formatting_entities=entities or None,
             )
             return True, None, False
 
-        if is_cached:
-            # ── Кеш есть: строим Telethon-объекты из строк кеша ──────────────
-            tl_files = []
-            for file_id_str in media_list:
-                tl_obj = await _telethon_file_from_cache(client, file_id_str)
-                if tl_obj:
-                    tl_files.append(tl_obj)
+        # Читаем байты в память прямо перед отправкой
+        bufs = []
+        for path in media_files:
+            try:
+                data = path.read_bytes()
+                buf = io.BytesIO(data)
+                buf.name = path.name
+                bufs.append(buf)
+            except Exception as e:
+                log.warning("Не удалось прочитать медиа %s: %s", path, e)
 
-            if not tl_files:
-                # Кеш испорчен — отправляем текст
-                log.warning("Задача %d: кеш file_id не удалось восстановить", task_id)
-                await client.send_message(
-                    entity, send_text or "",
-                    formatting_entities=entities or None,
-                )
-                return True, None, False
-
-            if len(tl_files) == 1:
-                await client.send_file(
-                    entity, file=tl_files[0],
-                    caption=send_text or "",
-                    formatting_entities=entities or None,
-                )
-            else:
-                await client.send_file(
-                    entity, file=tl_files,
-                    caption=send_text or "",
-                    formatting_entities=entities or None,
-                )
+        if not bufs:
+            log.warning("Задача %d: все медиа-файлы недоступны, отправляем текст", task_id)
+            await client.send_message(
+                entity, send_text or "",
+                formatting_entities=entities or None,
+            )
             return True, None, False
 
+        if len(bufs) == 1:
+            await client.send_file(
+                entity, file=bufs[0],
+                caption=send_text or "",
+                formatting_entities=entities or None,
+            )
         else:
-            # ── Кеша нет: первая отправка через байты ────────────────────────
-            # Сбрасываем позицию BytesIO перед отправкой
-            for buf in media_list:
-                buf.seek(0)
+            await client.send_file(
+                entity, file=bufs,
+                caption=send_text or "",
+                formatting_entities=entities or None,
+            )
 
-            if len(media_list) == 1:
-                sent = await client.send_file(
-                    entity, file=media_list[0],
-                    caption=send_text or "",
-                    formatting_entities=entities or None,
-                )
-            else:
-                sent = await client.send_file(
-                    entity, file=media_list,
-                    caption=send_text or "",
-                    formatting_entities=entities or None,
-                )
-
-            # Сохраняем кеш и удаляем байты
-            async with SessionLocal() as db:
-                await _save_media_cache_and_cleanup(db, task_id, account.id, sent)
-                await db.commit()
-
-            return True, None, False
+        return True, None, False
 
     except FloodWaitError as e:
         wait = min(e.seconds, 60)
         log.warning("FloodWait %ds для %s в %s", e.seconds, account.phone, chat_id)
         await asyncio.sleep(wait)
 
-        # Повтор после ожидания (упрощённый — только текст чтобы не усложнять)
         try:
             retry_text = _randomize_text(message_text)
             entity     = await _resolve_entity(client, chat_id)
@@ -682,20 +527,15 @@ async def _try_failover(
             await db.commit()
             return
 
-    bot = Bot(token=BOT_TOKEN)
-    try:
-        await handle_chat_restriction(
-            db=db,
-            account=await db.get(Account, failed_account_id),
-            task_id=task.id,
-            chat_id=chat_id,
-            reason=error or "no_replacement",
-            bot=bot,
-        )
-    except Exception as e:
-        log.error("Ошибка handle_chat_restriction: %s", e)
-    finally:
-        await bot.session.close()
+    # Нет ни одного подходящего аккаунта — вызываем handle_chat_restriction
+    # без Bot-объекта: restriction_service сам найдёт нужный токен зеркала
+    await handle_chat_restriction(
+        db=db,
+        account=await db.get(Account, failed_account_id),
+        task_id=task.id,
+        chat_id=chat_id,
+        reason=error or "no_replacement",
+    )
 
 
 async def _reassign_chat(
@@ -877,6 +717,7 @@ async def warmup_pool():
 
 async def main():
     await create_all_tables()
+    MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
     await warmup_pool()
 
     scheduler.add_job(sync_tasks,           "interval", seconds=30,  id="__sync__")
