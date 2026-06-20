@@ -1,3 +1,4 @@
+
 """
 services/payment_service.py — обработка платежей.
 Поддерживаемые методы: Telegram Stars, CryptoBot, TON (по комментарию).
@@ -98,3 +99,4 @@ async def create_cryptobot_invoice(plan: str, user_id: int) -> dict | None:
 def get_stars_price(plan: str) -> int:
     """Получить цену в Stars для плана."""
     return SUBSCRIPTION_PRICES[plan]["stars"]
+
