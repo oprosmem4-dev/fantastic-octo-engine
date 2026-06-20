@@ -286,7 +286,7 @@ async def send_chat_job(task_id: int, account_id: int, chat_id: str):
                     await _try_failover(db, task, account_id, chat_id)
             return
 
-        success, error, need_failover = await _send_with_client(
+        success, error, need_failover, msg_id = await _send_with_client(
             client, account, task_id, chat_id,
             message_text, has_media, format_entities,
         )
@@ -300,6 +300,7 @@ async def send_chat_job(task_id: int, account_id: int, chat_id: str):
                 chat_id=chat_id,
                 success=success,
                 error=error,
+                message_id=msg_id,
             ))
 
             if success:
@@ -331,6 +332,35 @@ async def send_chat_job(task_id: int, account_id: int, chat_id: str):
 
 # ── Отправка через клиент ──────────────────────────────────────────────────────
 
+def _extract_message_id(sent) -> int | None:
+    """Извлечь id отправленного сообщения (Message или список Message)."""
+    if sent is None:
+        return None
+    if isinstance(sent, list):
+        # send_file с несколькими файлами возвращает список — берём первый
+        sent = sent[0] if sent else None
+    return getattr(sent, "id", None)
+
+
+def _make_message_link(chat_id: str, message_id: int | None) -> str | None:
+    """
+    Прямая ссылка на сообщение в Telegram.
+      @username  → https://t.me/username/MSG_ID
+      -100XXXXX  → https://t.me/c/XXXXX/MSG_ID
+      прочее     → None
+    """
+    if not message_id:
+        return None
+    s = str(chat_id).strip()
+    if s.startswith("@"):
+        return f"https://t.me/{s.lstrip('@')}/{message_id}"
+    if s.lstrip("-").isdigit():
+        raw = str(int(s))
+        if raw.startswith("-100"):
+            return f"https://t.me/c/{raw[4:]}/{message_id}"
+    return None
+
+
 async def _send_with_client(
     client,
     account: Account,
@@ -339,9 +369,10 @@ async def _send_with_client(
     message_text: str,
     has_media: bool,
     entities_json: list[dict],
-) -> tuple[bool, str | None, bool]:
+) -> tuple[bool, str | None, bool, int | None]:
     """
     Отправить сообщение в один чат.
+    Возвращает (success, error, need_failover, message_id).
 
     Медиа читается с диска при каждой отправке — просто и надёжно.
     Файлы: /app/media/task_{task_id}/photo_0.jpg, photo_1.jpg, ...
@@ -352,28 +383,26 @@ async def _send_with_client(
     try:
         entity = await _resolve_entity(client, chat_id)
         if entity is None:
-            return False, "entity_not_found", False
+            return False, "entity_not_found", False, None
 
         if not has_media:
-            await client.send_message(
+            sent = await client.send_message(
                 entity, send_text or "",
                 formatting_entities=entities or None,
             )
-            return True, None, False
+            return True, None, False, _extract_message_id(sent)
 
         # ── Читаем медиа с диска ───────────────────────────────────────────────
         media_files = _get_task_media_files(task_id)
 
         if not media_files:
-            # Файлы удалены или не найдены — отправляем только текст
             log.warning("Задача %d: файлы медиа не найдены на диске, отправляем текст", task_id)
-            await client.send_message(
+            sent = await client.send_message(
                 entity, send_text or "",
                 formatting_entities=entities or None,
             )
-            return True, None, False
+            return True, None, False, _extract_message_id(sent)
 
-        # Читаем байты в память прямо перед отправкой
         bufs = []
         for path in media_files:
             try:
@@ -386,26 +415,26 @@ async def _send_with_client(
 
         if not bufs:
             log.warning("Задача %d: все медиа-файлы недоступны, отправляем текст", task_id)
-            await client.send_message(
+            sent = await client.send_message(
                 entity, send_text or "",
                 formatting_entities=entities or None,
             )
-            return True, None, False
+            return True, None, False, _extract_message_id(sent)
 
         if len(bufs) == 1:
-            await client.send_file(
+            sent = await client.send_file(
                 entity, file=bufs[0],
                 caption=send_text or "",
                 formatting_entities=entities or None,
             )
         else:
-            await client.send_file(
+            sent = await client.send_file(
                 entity, file=bufs,
                 caption=send_text or "",
                 formatting_entities=entities or None,
             )
 
-        return True, None, False
+        return True, None, False, _extract_message_id(sent)
 
     except FloodWaitError as e:
         wait = min(e.seconds, 60)
@@ -416,25 +445,25 @@ async def _send_with_client(
             retry_text = _randomize_text(message_text)
             entity     = await _resolve_entity(client, chat_id)
             if entity:
-                await client.send_message(
+                sent = await client.send_message(
                     entity, retry_text or "",
                     formatting_entities=_to_telethon_entities(entities_json) or None,
                 )
-                return True, None, False
+                return True, None, False, _extract_message_id(sent)
         except Exception as retry_e:
-            return False, str(retry_e)[:200], False
+            return False, str(retry_e)[:200], False, None
 
     except (UserBannedInChannelError, ChatWriteForbiddenError) as e:
         err = f"{type(e).__name__}: {e}"
         log.warning("Нет доступа %s → %s: %s", account.phone, chat_id, err)
-        return False, err, True
+        return False, err, True, None
 
     except (UserDeactivatedError, AuthKeyUnregisteredError) as e:
         err = f"account_frozen: {type(e).__name__}"
         log.error("Аккаунт %s заморожен/деактивирован", account.phone)
         asyncio.create_task(_mark_account_frozen(account.id))
         await remove_client(account.id)
-        return False, err, True
+        return False, err, True, None
 
     except Exception as e:
         err_str = str(e)
@@ -444,9 +473,9 @@ async def _send_with_client(
             "restricted", "kicked", "channel_private",
         ])
         log.error("Ошибка отправки %s → %s: %s", account.phone, chat_id, err_str)
-        return False, err_str[:200], is_access_err
+        return False, err_str[:200], is_access_err, None
 
-    return False, "unknown", False
+    return False, "unknown", False, None
 
 
 # ── Failover ───────────────────────────────────────────────────────────────────
@@ -490,7 +519,7 @@ async def _try_failover(
         sem = _get_semaphore(new_acc.id)
         async with sem:
             await _wait_rate_limit(new_acc.id)
-            success, err, _ = await _send_with_client(
+            success, err, _, _fmsg_id = await _send_with_client(
                 client, new_acc, task.id, chat_id,
                 message_text, has_media, format_entities,
             )
