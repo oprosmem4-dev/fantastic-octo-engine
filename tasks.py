@@ -703,3 +703,156 @@ def _reason_label(reason: str) -> str:
         "discussion_no_parent": "нужно вступить в канал вручную",
     }
     return labels.get(reason, reason)
+
+# ── Статистика задачи пользователя ────────────────────────────────────────────
+
+LOGS_PER_PAGE = 20
+
+
+def _make_message_link(chat_id: str, message_id: int | None) -> str | None:
+    """Строим ссылку на отправленное сообщение."""
+    if not message_id:
+        return None
+    s = str(chat_id).strip()
+    if s.startswith("@"):
+        return f"https://t.me/{s.lstrip('@')}/{message_id}"
+    if s.lstrip("-").isdigit():
+        raw = str(int(s))
+        if raw.startswith("-100"):
+            return f"https://t.me/c/{raw[4:]}/{message_id}"
+    return None
+
+
+@router.callback_query(F.data.startswith("tasks:stats:"))
+async def task_stats(query: CallbackQuery, user: User, db: AsyncSession):
+    """Статистика по задаче: кол-во отправок, успехи, ошибки."""
+    from sqlalchemy import func
+    from models import Log
+    from bot.keyboards import kb_task_stats
+
+    task_id = int(query.data.split(":")[2])
+    task = await task_service.get_task(db, task_id, user.id)
+    if not task:
+        await query.answer("Задача не найдена.", show_alert=True)
+        return
+
+    # Агрегаты
+    total_res = await db.execute(
+        select(func.count(Log.id)).where(Log.task_id == task_id)
+    )
+    total: int = total_res.scalar() or 0
+
+    success_res = await db.execute(
+        select(func.count(Log.id)).where(Log.task_id == task_id, Log.success == True)
+    )
+    success_cnt: int = success_res.scalar() or 0
+
+    fail_cnt = total - success_cnt
+
+    # Последние отправки (для превью)
+    last_res = await db.execute(
+        select(Log)
+        .where(Log.task_id == task_id, Log.success == True)
+        .order_by(Log.created_at.desc())
+        .limit(3)
+    )
+    recent_logs = last_res.scalars().all()
+
+    recent_lines = []
+    for lg in recent_logs:
+        link = _make_message_link(lg.chat_id, lg.message_id)
+        ts   = lg.created_at.strftime("%d.%m %H:%M") if lg.created_at else "—"
+        if link:
+            recent_lines.append(f'• <a href="{link}">{html.escape(lg.chat_id)}</a> — {ts}')
+        else:
+            recent_lines.append(f'• {html.escape(lg.chat_id)} — {ts}')
+
+    recent_block = "\n".join(recent_lines) if recent_lines else "  (нет данных)"
+
+    icon = "▶️" if task.is_active else "⏸"
+    text = (
+        f"{icon} <b>Статистика: {html.escape(task.name)}</b>\n\n"
+        f"📤 Всего отправок: <b>{total}</b>\n"
+        f"✅ Успешно: <b>{success_cnt}</b>\n"
+        f"❌ Ошибок: <b>{fail_cnt}</b>\n\n"
+        f"🕐 <b>Последние доставки:</b>\n{recent_block}"
+    )
+
+    await query.message.edit_text(
+        text,
+        reply_markup=kb_task_stats(task_id, success_cnt > 0),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+@router.callback_query(F.data.startswith("tasks:logs:"))
+async def task_logs_page(query: CallbackQuery, user: User, db: AsyncSession):
+    """Постраничный список ссылок на отправленные сообщения (20 на страницу)."""
+    from models import Log
+    from bot.keyboards import kb_task_logs_page
+
+    parts   = query.data.split(":")   # tasks:logs:TASK_ID:PAGE
+    task_id = int(parts[2])
+    page    = int(parts[3]) if len(parts) > 3 else 0
+
+    # Проверка прав
+    task = await task_service.get_task(db, task_id, user.id)
+    if not task:
+        await query.answer("Задача не найдена.", show_alert=True)
+        return
+
+    # Только успешные логи с message_id
+    from sqlalchemy import func
+    count_res = await db.execute(
+        select(func.count(Log.id)).where(
+            Log.task_id == task_id,
+            Log.success == True,
+            Log.message_id.isnot(None),
+        )
+    )
+    linkable_count: int = count_res.scalar() or 0
+
+    total_pages = max(1, -(-linkable_count // LOGS_PER_PAGE))   # ceiling div
+    page = max(0, min(page, total_pages - 1))
+
+    logs_res = await db.execute(
+        select(Log)
+        .where(Log.task_id == task_id, Log.success == True, Log.message_id.isnot(None))
+        .order_by(Log.created_at.desc())
+        .limit(LOGS_PER_PAGE)
+        .offset(page * LOGS_PER_PAGE)
+    )
+    logs = logs_res.scalars().all()
+
+    lines = []
+    for i, lg in enumerate(logs, start=page * LOGS_PER_PAGE + 1):
+        link = _make_message_link(lg.chat_id, lg.message_id)
+        ts   = lg.created_at.strftime("%d.%m %H:%M") if lg.created_at else "—"
+        if link:
+            lines.append(f'{i}. <a href="{link}">{html.escape(lg.chat_id)}</a> — {ts}')
+        else:
+            lines.append(f'{i}. {html.escape(lg.chat_id)} — {ts}')
+
+    if not lines:
+        lines = ["  (нет отправок с публичной ссылкой)"]
+
+    text = (
+        f"🔗 <b>Отправленные сообщения</b>\n"
+        f"Задача: <b>{html.escape(task.name)}</b>\n"
+        f"Страница {page + 1} / {total_pages} · всего {linkable_count} ссылок\n\n"
+        + "\n".join(lines)
+    )
+
+    await query.message.edit_text(
+        text,
+        reply_markup=kb_task_logs_page(task_id, page, total_pages),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+# noop handler for page indicator button
+@router.callback_query(F.data == "noop")
+async def cb_noop(query: CallbackQuery):
+    await query.answer()
