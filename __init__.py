@@ -84,6 +84,40 @@ class MirrorBot(Base):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ПЛАТЁЖНЫЕ БОТЫ (Stars)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PaymentBot(Base):
+    """
+    «Расходный» бот для приёма оплаты Telegram Stars.
+
+    Идея: Stars всегда падают на баланс того бота, чьим токеном был
+    выставлен счёт (это особенность Bot API, изменить нельзя). Поэтому
+    вместо того чтобы слать инвойс из главного бота / зеркала, мы
+    шлём пользователя по deep-link'у в отдельного "одноразового" бота,
+    который ничего не делает кроме выставления счёта.
+
+    is_active=True — ровно один бот, на него ведут ВСЕ новые кнопки
+    "Оплатить ⭐" (во всех зеркалах и в главном боте). Админ может
+    сменить его в любой момент через /admin → Платёжный бот.
+
+    Старые (is_active=False) боты НЕ останавливаются автоматически —
+    payment_bot_runner.py продолжает их поллинг, чтобы уже выданные
+    счета могли быть оплачены. Чтобы полностью остановить бота —
+    удалить его в админке (это убирает строку из БД, runner снимет
+    polling в течение ~10 секунд).
+    """
+    __tablename__ = "payment_bots"
+
+    id:             Mapped[int]        = mapped_column(Integer, primary_key=True, autoincrement=True)
+    token:          Mapped[str]        = mapped_column(String(120), unique=True)
+    bot_username:   Mapped[str | None] = mapped_column(String(64))
+    is_active:      Mapped[bool]       = mapped_column(Boolean, default=False)
+    payments_count: Mapped[int]        = mapped_column(Integer, default=0)
+    created_at:     Mapped[datetime]   = mapped_column(DateTime(timezone=True), default=now_utc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # АККАУНТЫ (Telethon userbots)
 # ─────────────────────────────────────────────────────────────────────────────
 
