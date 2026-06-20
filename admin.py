@@ -17,17 +17,20 @@ from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
 )
-from sqlalchemy import select, func
+from sqlalchemy import select, func, Integer
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config import OWNER_ID
+from config import OWNER_ID, BOT_TOKEN, GENERATOR_BOT_TOKEN
 from models import User, Account, Task, Payment
-from services import account_service
+from services import account_service, payment_bot_service
 from services.user_service import (
     get_user, get_all_users, block_user, unblock_user,
     set_max_chats, add_subscription, count_active_users,
 )
-from bot.keyboards import kb_admin_menu, kb_cancel, kb_back_to_menu
+from bot.keyboards import (
+    kb_admin_menu, kb_cancel, kb_back_to_menu,
+    kb_paybot_menu, kb_paybot_history, kb_paybot_detail,
+)
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -54,6 +57,10 @@ class AddSystemAccount(StatesGroup):
 
 class SetProxyState(StatesGroup):
     waiting = State()
+
+
+class SetPaymentBotState(StatesGroup):
+    token = State()
 
 
 # ── Вход в панель ─────────────────────────────────────────────────────────────
@@ -481,6 +488,154 @@ async def proxy_clear(query: CallbackQuery, user: User, db: AsyncSession):
     await admin_proxies(query, user, db)
 
 
+# ── Платёжный бот (Stars) ─────────────────────────────────────────────────────
+#
+# Stars всегда падают на баланс того бота, который выставил счёт — поэтому
+# мы используем отдельных "расходных" ботов, которых можно менять в любой
+# момент без перезапуска сервиса. payment_bot_runner.py подхватывает новый
+# бот (и продолжает держать живым старый, если он ещё в БД) в течение
+# ~10 секунд после смены здесь.
+
+@router.callback_query(F.data == "admin:paybot")
+async def admin_paybot_menu(query: CallbackQuery, user: User, db: AsyncSession):
+    if not is_admin(user):
+        return
+
+    active = await payment_bot_service.get_active_bot(db)
+
+    if active:
+        text = (
+            f"💳 *Платёжный бот для Stars*\n\n"
+            f"Активен: @{active.bot_username}\n"
+            f"Подключён: {active.created_at.strftime('%d.%m %H:%M')}\n"
+            f"Принято оплат: *{active.payments_count}*\n\n"
+            f"Кнопка «Оплатить ⭐» во всех ваших ботах и зеркалах ведёт сюда."
+        )
+    else:
+        text = (
+            "💳 *Платёжный бот для Stars*\n\n"
+            "❌ Не настроен — кнопка оплаты звёздами сейчас не показывается "
+            "пользователям (только «купить у администратора»).\n\n"
+            "Нажмите «Сменить бота», чтобы подключить."
+        )
+
+    await query.message.edit_text(text, reply_markup=kb_paybot_menu(bool(active)), parse_mode="Markdown")
+
+
+@router.callback_query(F.data == "admin:paybot:set")
+async def admin_paybot_set_start(query: CallbackQuery, state: FSMContext, user: User):
+    if not is_admin(user):
+        return
+    await query.message.edit_text(
+        "🔄 *Смена платёжного бота*\n\n"
+        "Создайте нового бота у @BotFather (или возьмите уже готового —\n"
+        "специальных требований к нему нет, кроме включённых платежей)\n"
+        "и пришлите его токен сюда.\n\n"
+        "⚠️ Не используйте токен основного бота или зеркал — это вызовет "
+        "конфликт polling'а.\n\n"
+        "Через ~10 секунд все новые кнопки «Оплатить ⭐» переключатся "
+        "на этого бота.",
+        reply_markup=kb_cancel(),
+        parse_mode="Markdown",
+    )
+    await state.set_state(SetPaymentBotState.token)
+
+
+@router.message(SetPaymentBotState.token)
+async def admin_paybot_set_got(message: Message, state: FSMContext, user: User, db: AsyncSession):
+    if not is_admin(user):
+        return
+
+    token = (message.text or "").strip()
+    await state.clear()
+
+    if token in (BOT_TOKEN, GENERATOR_BOT_TOKEN):
+        await message.answer(
+            "❌ Нельзя использовать токен основного или генератор-бота — "
+            "два процесса не могут одновременно делать polling одним токеном.",
+            reply_markup=kb_back_to_menu(),
+        )
+        return
+
+    await message.answer("🔍 Проверяю токен через Telegram...")
+
+    try:
+        bot_row = await payment_bot_service.set_active_bot(db, token)
+    except payment_bot_service.InvalidTokenError as e:
+        await message.answer(
+            f"❌ Токен не прошёл проверку: `{e}`\n\nПопробуйте снова /admin → Платёжный бот.",
+            reply_markup=kb_back_to_menu(),
+            parse_mode="Markdown",
+        )
+        return
+
+    await message.answer(
+        f"✅ Платёжный бот сменён на *@{bot_row.bot_username}*\n\n"
+        f"Если бот новый — запуск polling займёт до ~10 секунд.\n"
+        f"Все новые кнопки «Оплатить ⭐» поведут именно туда.",
+        reply_markup=kb_back_to_menu(),
+        parse_mode="Markdown",
+    )
+    log.info("Админ %d сменил платёжный бот на @%s", user.id, bot_row.bot_username)
+
+
+@router.callback_query(F.data == "admin:paybot:deactivate")
+async def admin_paybot_deactivate(query: CallbackQuery, user: User, db: AsyncSession):
+    if not is_admin(user):
+        return
+    await payment_bot_service.deactivate_all(db)
+    await query.answer("⏸ Оплата Stars деактивирована.")
+    await admin_paybot_menu(query, user, db)
+
+
+@router.callback_query(F.data == "admin:paybot:history")
+async def admin_paybot_history(query: CallbackQuery, user: User, db: AsyncSession):
+    if not is_admin(user):
+        return
+    bots = await payment_bot_service.get_all_bots(db)
+    text = "📜 *История платёжных ботов*" if bots else "📜 Пока нет ни одного добавленного бота."
+    await query.message.edit_text(text, reply_markup=kb_paybot_history(bots), parse_mode="Markdown")
+
+
+@router.callback_query(F.data.startswith("admin:paybot:view:"))
+async def admin_paybot_view(query: CallbackQuery, user: User, db: AsyncSession):
+    if not is_admin(user):
+        return
+    bot_id = int(query.data.split(":")[-1])
+    bot_row = await payment_bot_service.get_bot_by_id(db, bot_id)
+    if not bot_row:
+        await query.answer("Не найден.", show_alert=True)
+        return
+
+    text = (
+        f"🤖 *@{bot_row.bot_username}*\n\n"
+        f"Статус: {'✅ Активен' if bot_row.is_active else '⏸ Не активен (но всё ещё принимает уже выданные счета)'}\n"
+        f"Подключён: {bot_row.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+        f"Принято оплат: *{bot_row.payments_count}*"
+    )
+    await query.message.edit_text(text, reply_markup=kb_paybot_detail(bot_row), parse_mode="Markdown")
+
+
+@router.callback_query(F.data.startswith("admin:paybot:activate:"))
+async def admin_paybot_activate(query: CallbackQuery, user: User, db: AsyncSession):
+    if not is_admin(user):
+        return
+    bot_id = int(query.data.split(":")[-1])
+    ok = await payment_bot_service.activate_existing(db, bot_id)
+    await query.answer("✅ Активирован." if ok else "❌ Не найден.")
+    await admin_paybot_history(query, user, db)
+
+
+@router.callback_query(F.data.startswith("admin:paybot:delete:"))
+async def admin_paybot_delete(query: CallbackQuery, user: User, db: AsyncSession):
+    if not is_admin(user):
+        return
+    bot_id = int(query.data.split(":")[-1])
+    await payment_bot_service.delete_bot(db, bot_id)
+    await query.answer("🗑 Удалён — polling остановится в течение ~10 секунд.")
+    await admin_paybot_history(query, user, db)
+
+
 # ── Добавление системного аккаунта ────────────────────────────────────────────
 
 @router.callback_query(F.data == "admin:addacc")
@@ -685,3 +840,394 @@ async def confirm_broadcast(query: CallbackQuery, state: FSMContext, user: User,
         parse_mode="Markdown",
     )
     log.info("Broadcast от %d: sent=%d failed=%d", user.id, sent, failed)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# АДМИН: ЗАДАЧИ ВСЕХ ПОЛЬЗОВАТЕЛЕЙ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ADMIN_LOGS_PER_PAGE = 20
+
+
+def _admin_make_message_link(chat_id: str, message_id: int | None) -> str | None:
+    if not message_id:
+        return None
+    s = str(chat_id).strip()
+    if s.startswith("@"):
+        return f"https://t.me/{s.lstrip('@')}/{message_id}"
+    if s.lstrip("-").isdigit():
+        raw = str(int(s))
+        if raw.startswith("-100"):
+            return f"https://t.me/c/{raw[4:]}/{message_id}"
+    return None
+
+
+@router.callback_query(F.data == "admin:all_tasks")
+async def admin_all_tasks(query: CallbackQuery, user: User, db: AsyncSession):
+    """Список всех пользователей у которых есть задачи."""
+    if not is_admin(user):
+        return
+
+    from models import Task
+    from sqlalchemy import func
+    # Пользователи с задачами, сортировка по кол-ву задач убывающие
+    result = await db.execute(
+        select(User.id, User.username, User.full_name, func.count(Task.id).label("task_count"))
+        .join(Task, Task.user_id == User.id)
+        .group_by(User.id, User.username, User.full_name)
+        .order_by(func.count(Task.id).desc())
+        .limit(50)
+    )
+    rows = result.all()
+
+    if not rows:
+        await query.message.edit_text(
+            "📋 Нет ни одной задачи в системе.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="◀️ Назад", callback_data="admin:menu")
+            ]]),
+        )
+        return
+
+    buttons = []
+    for uid, uname, fname, cnt in rows:
+        label = f"@{uname}" if uname else (fname or str(uid))
+        buttons.append([InlineKeyboardButton(
+            text=f"👤 {label} — {cnt} задач",
+            callback_data=f"admin:tasks:user:{uid}",
+        )])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin:menu")])
+
+    await query.message.edit_text(
+        f"📋 <b>Задачи пользователей</b> (топ-50 по кол-ву):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("admin:tasks:user:"))
+async def admin_tasks_of_user(query: CallbackQuery, user: User, db: AsyncSession):
+    """Список задач конкретного пользователя (для администратора)."""
+    if not is_admin(user):
+        return
+
+    from models import Task, Log
+    from sqlalchemy import func
+
+    uid = int(query.data.split(":")[-1])
+    target = await get_user(db, uid)
+    if not target:
+        await query.answer("Пользователь не найден.", show_alert=True)
+        return
+
+    result = await db.execute(
+        select(Task)
+        .where(Task.user_id == uid)
+        .order_by(Task.created_at.desc())
+    )
+    tasks = result.scalars().all()
+
+    if not tasks:
+        await query.message.edit_text(
+            f"У пользователя нет задач.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="◀️ Назад", callback_data="admin:all_tasks")
+            ]]),
+        )
+        return
+
+    uname   = f"@{target.username}" if target.username else target.full_name
+    buttons = []
+    for t in tasks:
+        icon   = "▶️" if t.is_active else "⏸"
+        buttons.append([InlineKeyboardButton(
+            text=f"{icon} {t.name}",
+            callback_data=f"admin:task:view:{t.id}",
+        )])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin:all_tasks")])
+
+    await query.message.edit_text(
+        f"📋 <b>Задачи пользователя {uname}</b>:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("admin:task:view:"))
+async def admin_task_view(query: CallbackQuery, user: User, db: AsyncSession):
+    """Полная карточка задачи для администратора."""
+    if not is_admin(user):
+        return
+
+    from models import Task, TaskChat, TaskAccount, Log, Account
+    from sqlalchemy import func
+    from sqlalchemy.orm import selectinload
+
+    task_id = int(query.data.split(":")[-1])
+
+    result = await db.execute(
+        select(Task)
+        .options(
+            selectinload(Task.chats),
+            selectinload(Task.accounts).selectinload(TaskAccount.account),
+            selectinload(Task.user),
+        )
+        .where(Task.id == task_id)
+    )
+    task = result.scalar_one_or_none()
+    if not task:
+        await query.answer("Задача не найдена.", show_alert=True)
+        return
+
+    # Статистика по аккаунтам
+    acc_stats_res = await db.execute(
+        select(
+            Log.account_id,
+            func.count(Log.id).label("total"),
+            func.sum(Log.success.cast(Integer)).label("success_cnt"),
+        )
+        .where(Log.task_id == task_id)
+        .group_by(Log.account_id)
+    )
+    acc_stats = {row.account_id: (row.total, int(row.success_cnt or 0)) for row in acc_stats_res.all()}
+
+    total_sent    = sum(v[1] for v in acc_stats.values())
+    total_any     = sum(v[0] for v in acc_stats.values())
+    total_failed  = total_any - total_sent
+
+    # Имя пользователя
+    u = task.user
+    uname = f"@{u.username}" if u.username else u.full_name
+
+    # Чаты (первые 10)
+    chats_lines = [f"• {c.chat_title or c.chat_id}" for c in task.chats[:10]]
+    if len(task.chats) > 10:
+        chats_lines.append(f"…и ещё {len(task.chats) - 10}")
+
+    # Аккаунты с нагрузкой
+    acc_lines = []
+    for ta in task.accounts:
+        import json as _json
+        cnt  = len(_json.loads(ta.chat_ids or "[]"))
+        acc  = ta.account
+        name = acc.phone if acc else f"acc#{ta.account_id}"
+        sent_cnt = acc_stats.get(ta.account_id, (0, 0))[1]
+        acc_lines.append(f"• {name}: {cnt} чатов, {sent_cnt} отправок")
+
+    # Медиа
+    from pathlib import Path
+    import os
+    media_root  = Path(os.getenv("MEDIA_ROOT", "/app/media"))
+    media_dir   = media_root / f"task_{task.id}"
+    media_files = sorted(media_dir.glob("photo_*.jpg")) if media_dir.exists() else []
+
+    icon     = "▶️" if task.is_active else "⏸"
+    created  = task.created_at.strftime("%d.%m.%Y %H:%M") if task.created_at else "—"
+    has_media_note = f"📷 {len(media_files)} фото" if media_files else "📝 без фото"
+
+    text = (
+        f"{icon} <b>{task.name}</b>  [ID: {task.id}]\n"
+        f"👤 Владелец: {uname} (<code>{task.user_id}</code>)\n"
+        f"📅 Создана: {created}\n"
+        f"⏱ Интервал: каждые {task.interval_minutes} мин.\n"
+        f"{has_media_note}\n\n"
+        f"📊 <b>Статистика:</b>\n"
+        f"  Отправлено: {total_sent}  |  Ошибок: {total_failed}\n\n"
+        f"🏷 <b>Чаты ({len(task.chats)}):</b>\n" + "\n".join(chats_lines or ["—"]) + "\n\n"
+        f"🤖 <b>Аккаунты:</b>\n" + "\n".join(acc_lines or ["—"]) + "\n\n"
+        f"💬 <b>Текст сообщения:</b>\n"
+        f"<blockquote expandable>{task.message[:500]}</blockquote>"
+    )
+
+    from bot.keyboards import kb_admin_task_detail
+    await query.message.edit_text(
+        text,
+        reply_markup=kb_admin_task_detail(task.id, task.is_active, task.user_id),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+@router.callback_query(F.data.startswith("admin:task:toggle:"))
+async def admin_task_toggle(query: CallbackQuery, user: User, db: AsyncSession):
+    """Остановить / запустить задачу любого пользователя (только для администратора)."""
+    if not is_admin(user):
+        return
+
+    from models import Task
+    task_id = int(query.data.split(":")[-1])
+    result  = await db.execute(select(Task).where(Task.id == task_id))
+    task    = result.scalar_one_or_none()
+    if not task:
+        await query.answer("Задача не найдена.", show_alert=True)
+        return
+
+    task.is_active = not task.is_active
+    await db.commit()
+
+    status = "запущена ▶️" if task.is_active else "остановлена ⏸"
+    await query.answer(f"Задача {status}")
+    # Обновить карточку
+    await admin_task_view(query, user, db)
+
+
+@router.callback_query(F.data.startswith("admin:task:logs:"))
+async def admin_task_logs(query: CallbackQuery, user: User, db: AsyncSession):
+    """Постраничные ссылки на сообщения задачи (для администратора)."""
+    if not is_admin(user):
+        return
+
+    from models import Task, Log, TaskAccount
+    from sqlalchemy import func
+
+    parts   = query.data.split(":")    # admin:task:logs:TASK_ID:PAGE
+    task_id = int(parts[3])
+    page    = int(parts[4]) if len(parts) > 4 else 0
+
+    result = await db.execute(select(Task).where(Task.id == task_id))
+    task   = result.scalar_one_or_none()
+    if not task:
+        await query.answer("Задача не найдена.", show_alert=True)
+        return
+
+    count_res = await db.execute(
+        select(func.count(Log.id)).where(
+            Log.task_id == task_id,
+            Log.success == True,
+            Log.message_id.isnot(None),
+        )
+    )
+    linkable: int = count_res.scalar() or 0
+    total_pages   = max(1, -(-linkable // ADMIN_LOGS_PER_PAGE))
+    page          = max(0, min(page, total_pages - 1))
+
+    logs_res = await db.execute(
+        select(Log)
+        .where(Log.task_id == task_id, Log.success == True, Log.message_id.isnot(None))
+        .order_by(Log.created_at.desc())
+        .limit(ADMIN_LOGS_PER_PAGE)
+        .offset(page * ADMIN_LOGS_PER_PAGE)
+    )
+    logs  = logs_res.scalars().all()
+    lines = []
+    for i, lg in enumerate(logs, start=page * ADMIN_LOGS_PER_PAGE + 1):
+        link = _admin_make_message_link(lg.chat_id, lg.message_id)
+        ts   = lg.created_at.strftime("%d.%m %H:%M") if lg.created_at else "—"
+        if link:
+            lines.append(f'{i}. <a href="{link}">{lg.chat_id}</a> — {ts}')
+        else:
+            lines.append(f'{i}. {lg.chat_id} — {ts}')
+
+    if not lines:
+        lines = ["  (нет отправок с публичной ссылкой)"]
+
+    text = (
+        f"🔗 <b>Сообщения задачи</b> «{task.name}»\n"
+        f"Стр. {page + 1} / {total_pages} · {linkable} ссылок\n\n"
+        + "\n".join(lines)
+    )
+
+    from bot.keyboards import kb_admin_tasks_logs_page
+    await query.message.edit_text(
+        text,
+        reply_markup=kb_admin_tasks_logs_page(task_id, page, total_pages, task.user_id),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# АДМИН: АККАУНТЫ ВСЕХ ПОЛЬЗОВАТЕЛЕЙ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.callback_query(F.data == "admin:all_accounts")
+async def admin_all_user_accounts(query: CallbackQuery, user: User, db: AsyncSession):
+    """
+    Все пользовательские (не системные) аккаунты в системе,
+    сгруппированные по владельцам.
+    """
+    if not is_admin(user):
+        return
+
+    from models import Account
+    from sqlalchemy import func
+
+    result = await db.execute(
+        select(
+            User.id,
+            User.username,
+            User.full_name,
+            func.count(Account.id).label("acc_count"),
+        )
+        .join(Account, Account.owner_id == User.id)
+        .where(Account.is_system == False)
+        .group_by(User.id, User.username, User.full_name)
+        .order_by(func.count(Account.id).desc())
+        .limit(50)
+    )
+    rows = result.all()
+
+    if not rows:
+        await query.message.edit_text(
+            "🤖 Пользователи ещё не добавляли личных аккаунтов.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="◀️ Назад", callback_data="admin:menu")
+            ]]),
+        )
+        return
+
+    buttons = []
+    for uid, uname, fname, cnt in rows:
+        label = f"@{uname}" if uname else (fname or str(uid))
+        buttons.append([InlineKeyboardButton(
+            text=f"👤 {label} — {cnt} акк.",
+            callback_data=f"admin:accs:user:{uid}",
+        )])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin:menu")])
+
+    await query.message.edit_text(
+        "🤖 <b>Пользовательские аккаунты</b>:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("admin:accs:user:"))
+async def admin_user_accounts_list(query: CallbackQuery, user: User, db: AsyncSession):
+    """Аккаунты конкретного пользователя."""
+    if not is_admin(user):
+        return
+
+    from models import Account
+    uid    = int(query.data.split(":")[-1])
+    target = await get_user(db, uid)
+    if not target:
+        await query.answer("Пользователь не найден.", show_alert=True)
+        return
+
+    result = await db.execute(
+        select(Account).where(Account.owner_id == uid, Account.is_system == False)
+        .order_by(Account.created_at.desc())
+    )
+    accounts = result.scalars().all()
+
+    uname = f"@{target.username}" if target.username else target.full_name
+    lines = []
+    for acc in accounts:
+        proxy = f" 🌐{acc.proxy_host}" if acc.proxy_host else ""
+        lines.append(
+            f"{acc.status_icon} <code>{acc.phone}</code> — {acc.chats_count} чатов"
+            f", {acc.sends_last_hour}/ч{proxy}"
+        )
+
+    text = (
+        f"🤖 <b>Аккаунты пользователя {uname}</b> (<code>{uid}</code>)\n\n"
+        + ("\n".join(lines) or "(нет аккаунтов)")
+    )
+
+    await query.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="◀️ Назад", callback_data="admin:all_accounts")
+        ]]),
+        parse_mode="HTML",
+    )
