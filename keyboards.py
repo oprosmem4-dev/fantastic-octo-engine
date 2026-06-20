@@ -22,16 +22,9 @@ def kb_main_menu(has_access: bool) -> InlineKeyboardMarkup:
 
 
 def kb_subscription_plans(is_mirror: bool = False) -> InlineKeyboardMarkup:
-    """Кнопки выбора тарифного плана. Только Stars + у админа."""
-    if is_mirror:
-        return InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text="💳 Оплатить в главном боте",
-                url=MAIN_BOT_LINK
-            )
-        ]])
+    """Кнопки выбора тарифного плана. Оплата через администратора."""
     builder = InlineKeyboardBuilder()
-    labels = {"1month": "1 месяц", "1week" : "1 неделя", "6month": "6 месяцев"}
+    labels = {"1month": "1 месяц", "1week": "1 неделя", "6month": "6 месяцев"}
     for plan, info in SUBSCRIPTION_PRICES.items():
         label = f"{labels[plan]} — {info['stars']}⭐"
         builder.button(text=label, callback_data=f"pay:select:{plan}")
@@ -59,10 +52,11 @@ def kb_task_detail(task: Task) -> InlineKeyboardMarkup:
     """Управление конкретной задачей."""
     builder = InlineKeyboardBuilder()
     toggle_text = "⏸ Остановить" if task.is_active else "▶️ Запустить"
-    builder.button(text=toggle_text,      callback_data=f"tasks:toggle:{task.id}")
-    builder.button(text="🗑 Удалить",     callback_data=f"tasks:delete:{task.id}")
-    builder.button(text="◀️ К задачам",  callback_data="tasks:list")
-    builder.adjust(2, 1)
+    builder.button(text=toggle_text,           callback_data=f"tasks:toggle:{task.id}")
+    builder.button(text="🗑 Удалить",          callback_data=f"tasks:delete:{task.id}")
+    builder.button(text="📊 Статистика",       callback_data=f"tasks:stats:{task.id}")
+    builder.button(text="◀️ К задачам",        callback_data="tasks:list")
+    builder.adjust(2, 1, 1)
     return builder.as_markup()
 
 
@@ -161,10 +155,82 @@ def kb_choose_sender(accounts: list[Account]) -> InlineKeyboardMarkup:
 
 def kb_admin_menu() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="👥 Пользователи",   callback_data="admin:users")
-    builder.button(text="🤖 Аккаунты",       callback_data="admin:accounts")
-    builder.button(text="📊 Статистика",     callback_data="admin:stats")
-    builder.button(text="📢 Рассылка всем",  callback_data="admin:broadcast")
-    builder.button(text="◀️ Меню",           callback_data="menu:new")
-    builder.adjust(2, 2, 1)
+    builder.button(text="👥 Пользователи",    callback_data="admin:users")
+    builder.button(text="🤖 Сист. аккаунты", callback_data="admin:accounts")
+    builder.button(text="👤 Акк. польз.",     callback_data="admin:all_accounts")
+    builder.button(text="📋 Все задачи",      callback_data="admin:all_tasks")
+    builder.button(text="📊 Статистика",      callback_data="admin:stats")
+    builder.button(text="💳 Платёжный бот",   callback_data="admin:paybot")
+    builder.button(text="📢 Рассылка всем",   callback_data="admin:broadcast")
+    builder.button(text="◀️ Меню",            callback_data="menu:new")
+    builder.adjust(2, 2, 2, 2)
+    return builder.as_markup()
+
+# ── Пагинация логов задачи ────────────────────────────────────────────────────
+
+def kb_task_logs_page(task_id: int, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    """
+    Клавиатура для постраничного просмотра ссылок на сообщения задачи.
+    20 ссылок на страницу. Навигация: ← / →, возврат к задаче.
+    """
+    builder = InlineKeyboardBuilder()
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"tasks:logs:{task_id}:{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"tasks:logs:{task_id}:{page + 1}"))
+    if nav:
+        builder.row(*nav)
+
+    builder.row(InlineKeyboardButton(
+        text=f"📄 {page + 1} / {total_pages}",
+        callback_data="noop",
+    ))
+    builder.row(InlineKeyboardButton(text="📊 К статистике", callback_data=f"tasks:stats:{task_id}"))
+    builder.row(InlineKeyboardButton(text="◀️ К задаче", callback_data=f"tasks:view:{task_id}"))
+    return builder.as_markup()
+
+
+def kb_task_stats(task_id: int, has_logs: bool) -> InlineKeyboardMarkup:
+    """Клавиатура экрана статистики задачи."""
+    builder = InlineKeyboardBuilder()
+    if has_logs:
+        builder.button(text="🔗 Ссылки на сообщения", callback_data=f"tasks:logs:{task_id}:0")
+    builder.button(text="◀️ К задаче", callback_data=f"tasks:view:{task_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+# ── Админ: задачи всех пользователей ─────────────────────────────────────────
+
+def kb_admin_task_detail(task_id: int, is_active: bool, user_id: int) -> InlineKeyboardMarkup:
+    """Карточка задачи в панели администратора."""
+    builder = InlineKeyboardBuilder()
+    toggle_text = "⏸ Остановить задачу" if is_active else "▶️ Запустить задачу"
+    builder.button(text=toggle_text, callback_data=f"admin:task:toggle:{task_id}")
+    builder.button(text="🔗 Ссылки на сообщения", callback_data=f"admin:task:logs:{task_id}:0")
+    builder.button(text="◀️ К задачам польз.", callback_data=f"admin:tasks:user:{user_id}")
+    builder.button(text="◀️ Все задачи", callback_data="admin:all_tasks")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def kb_admin_tasks_logs_page(task_id: int, page: int, total_pages: int, user_id: int) -> InlineKeyboardMarkup:
+    """Пагинация логов в панели администратора."""
+    builder = InlineKeyboardBuilder()
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"admin:task:logs:{task_id}:{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"admin:task:logs:{task_id}:{page + 1}"))
+    if nav:
+        builder.row(*nav)
+
+    builder.row(InlineKeyboardButton(
+        text=f"📄 {page + 1} / {total_pages}",
+        callback_data="noop",
+    ))
+    builder.row(InlineKeyboardButton(text="◀️ К задаче", callback_data=f"admin:task:view:{task_id}"))
     return builder.as_markup()
